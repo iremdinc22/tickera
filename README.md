@@ -382,27 +382,25 @@ This experiment verifies the first concurrency invariant of Tickera:
 
 ---
 
-## Development Note
+## Concurrency Testing Note
 
-During the initial concurrency experiment, an artificial delay is temporarily introduced between reading and updating the seat:
+During the initial concurrency experiment, an artificial delay was temporarily introduced between reading and updating the seat:
 
 ```java
-try {
-    Thread.sleep(3000);
-} catch (InterruptedException e) {
-    Thread.currentThread().interrupt();
-}
+Thread.sleep(3000);
 ```
 
-This delay intentionally widens the race-condition window so that concurrent behavior can be reproduced consistently during development.
+The delay widened the race-condition window and made the double-booking problem easier to reproduce consistently.
 
-It is not part of the production design and will be removed after the experiment.
+After reproducing the race condition and verifying the pessimistic locking strategy, the artificial delay was removed.
+
+The booking flow now relies on database-level pessimistic locking without any artificial delay.
 
 ---
 
 ## Next Milestone
 
-The next step is to remove the artificial delay and test the booking endpoint under higher concurrent load.
+The next step is to test the booking endpoint under higher concurrent load.
 
 The objective will be to measure:
 

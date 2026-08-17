@@ -29,12 +29,6 @@ public class BookingService {
             throw new SeatNotAvailableException("Seat is not available");
         }
 
-        try {
-            Thread.sleep(3000);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
-
         seat.setStatus(SeatStatus.BOOKED);
 
         Booking booking = Booking.builder()
@@ -50,7 +44,6 @@ public class BookingService {
                 savedBooking.getSeat().getSeatNumber(),
                 savedBooking.getUserId(),
                 savedBooking.getStatus(),
-                savedBooking.getCreatedAt()
-        );
+                savedBooking.getCreatedAt());
     }
 }

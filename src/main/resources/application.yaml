@@ -1,0 +1,19 @@
+spring:
+  application:
+    name: tickera
+
+  datasource:
+    url: jdbc:postgresql://localhost:5436/tickera
+    username: tickera
+    password: tickera
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health

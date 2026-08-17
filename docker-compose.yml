@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: tickera-postgres
+    environment:
+      POSTGRES_DB: tickera
+      POSTGRES_USER: tickera
+      POSTGRES_PASSWORD: tickera
+    ports:
+      - "5436:5432"
+    volumes:
+      - tickera_postgres_data:/var/lib/postgresql/data
+
+volumes:
+  tickera_postgres_data:

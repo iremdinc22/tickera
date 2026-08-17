@@ -6,14 +6,16 @@ spring:
     url: jdbc:postgresql://localhost:5436/tickera
     username: tickera
     password: tickera
+    hikari:
+      maximum-pool-size: 10
 
   jpa:
     hibernate:
       ddl-auto: update
-    show-sql: true
+    show-sql: false
 
 management:
   endpoints:
     web:
       exposure:
-        include: health
+        include: health,info,metrics

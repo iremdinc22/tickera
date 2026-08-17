@@ -9,8 +9,13 @@ const unexpectedResponses = new Counter('unexpected_responses');
 const validBookingResponse = new Rate('valid_booking_response');
 
 export const options = {
-  vus: 100,
-  iterations: 100,
+  scenarios: {
+    parallel_load: {
+      executor: 'constant-vus',
+      vus: 100,
+      duration: '10s',
+    },
+  },
 
   thresholds: {
     valid_booking_response: ['rate==1'],
@@ -20,11 +25,13 @@ export const options = {
 };
 
 export default function () {
-  const seatId = 9;
+  const firstSeatId = 413;
+
+  const seatId = firstSeatId + (__VU - 1);
 
   const payload = JSON.stringify({
     seatId,
-    userId: `user-${__VU}-${__ITER}`,
+    userId: `parallel-user-${__VU}-${__ITER}`,
   });
 
   const params = {
@@ -32,7 +39,7 @@ export default function () {
       'Content-Type': 'application/json',
     },
     tags: {
-      endpoint: 'create-booking',
+      endpoint: 'parallel-booking',
     },
   };
 

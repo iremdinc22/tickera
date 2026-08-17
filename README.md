@@ -1,14 +1,16 @@
 # Tickera — High-Concurrency Ticket Booking System
 
-Tickera is a backend engineering project focused on one core problem:
+Tickera is a backend engineering project focused on one deceptively simple problem:
 
 > How can a ticket booking system remain correct when many users try to reserve the same limited set of seats at the same time?
 
-Building a basic booking API is straightforward. Preventing the same seat from being sold twice under concurrent load is not.
+Building a basic booking API is straightforward.
+
+Preventing the same seat from being sold twice under concurrent load — while keeping latency and throughput under control — is not.
 
 Tickera explores how a simple booking service evolves as concurrency, traffic, and system complexity increase.
 
-The project follows a problem-driven approach:
+The project follows a problem-driven engineering approach:
 
 ```text
 Reproduce the failure
@@ -20,16 +22,16 @@ Understand why it happens
 Implement a solution
         │
         ▼
-Test it under concurrency
+Test under concurrency
         │
         ▼
 Measure the result
         │
         ▼
-Identify the next bottleneck
+Make the next architecture decision
 ```
 
-The current focus is concurrency control and database locking. Future stages will introduce distributed coordination, idempotency, event-driven processing, observability, and failure handling only when the system reaches problems that justify them.
+Infrastructure is introduced only when a demonstrated engineering problem justifies it.
 
 ---
 
@@ -72,15 +74,7 @@ bookingRepository.save(booking);
 
 The problem appears when multiple transactions execute concurrently.
 
-Both transactions may read:
-
-```text
-Seat A1 → AVAILABLE
-```
-
-before either transaction updates the row.
-
-That creates a race condition.
+Both transactions may observe the same seat as `AVAILABLE` before either transaction commits.
 
 ---
 
@@ -90,21 +84,19 @@ The first concurrency invariant defined for Tickera is:
 
 > A seat must never be successfully booked more than once.
 
-This invariant must remain true regardless of how many users attempt to book the seat concurrently.
+The first phase of the project therefore focused on:
 
-The first phase of the project was therefore designed to:
-
-1. Reproduce a real double-booking race condition.
-2. Verify the failure at the database level.
-3. Introduce a concurrency-control strategy.
-4. Repeat the same experiment.
-5. Validate that the invariant now holds.
+- Reproducing a real double-booking race condition
+- Verifying the failure directly in PostgreSQL
+- Introducing a concurrency-control strategy
+- Repeating the same experiment
+- Validating that the invariant now holds
 
 ---
 
 ## Reproducing the Race Condition
 
-Before adding concurrency protection, two booking requests were sent simultaneously for the same seat.
+Two booking requests were sent concurrently for the same seat.
 
 ```bash
 curl -s -X POST http://localhost:8080/bookings \
@@ -118,9 +110,9 @@ curl -s -X POST http://localhost:8080/bookings \
 wait
 ```
 
-Both requests succeeded.
+Before concurrency protection, both requests succeeded.
 
-The database confirmed that two booking records had been created for the same seat:
+The database contained two bookings for the same seat:
 
 ```text
  id | seat_id | user_id | status
@@ -129,27 +121,22 @@ The database confirmed that two booking records had been created for the same se
   5 |       4 | user-a  | PENDING
 ```
 
-The system had violated its core invariant:
-
 ```text
 Same seat
    │
    ├──── user-a → booking created
-   │
    └──── user-b → booking created
 
 ❌ DOUBLE BOOKING
 ```
 
-This confirmed that sequential correctness was not enough.
+Sequential correctness was not enough.
 
 ---
 
 ## First Solution — Pessimistic Row Locking
 
-The first concurrency-control strategy implemented in Tickera is database-level pessimistic locking.
-
-The seat is loaded with a write lock:
+The first concurrency strategy implemented in Tickera is database-level pessimistic locking.
 
 ```java
 @Lock(LockModeType.PESSIMISTIC_WRITE)
@@ -157,14 +144,14 @@ The seat is loaded with a write lock:
 Optional<Seat> findByIdForUpdate(@Param("id") Long id);
 ```
 
-The booking transaction uses the locking query:
+The booking transaction retrieves the seat using this locking query:
 
 ```java
 Seat seat = seatRepository.findByIdForUpdate(request.seatId())
         .orElseThrow(() -> new RuntimeException("Seat not found"));
 ```
 
-Conceptually, PostgreSQL performs an operation similar to:
+Conceptually, PostgreSQL executes behavior equivalent to:
 
 ```sql
 SELECT *
@@ -173,29 +160,7 @@ WHERE id = ?
 FOR UPDATE;
 ```
 
-The selected seat row remains locked until the transaction commits or rolls back.
-
----
-
-## How Pessimistic Locking Changes the Flow
-
-Without locking:
-
-```text
-Transaction A                  Transaction B
-
-READ AVAILABLE                 READ AVAILABLE
-      │                              │
-      ▼                              ▼
-UPDATE BOOKED                  UPDATE BOOKED
-      │                              │
-      ▼                              ▼
-CREATE BOOKING                 CREATE BOOKING
-
-                ❌
-```
-
-With pessimistic locking:
+The selected row remains locked until the transaction commits or rolls back.
 
 ```text
 Transaction A                  Transaction B
@@ -207,9 +172,7 @@ SELECT FOR UPDATE 🔒
       │                           WAITING
       ▼                              │
 UPDATE BOOKED                       │
-      │                              │
 CREATE BOOKING                      │
-      │                              │
 COMMIT 🔓                            │
                                      ▼
                                READ BOOKED
@@ -218,111 +181,45 @@ COMMIT 🔓                            │
                                 409 Conflict
 ```
 
-Only one transaction can successfully claim the same seat.
-
-The second transaction waits until the first finishes, then reads the updated state and receives a conflict response.
-
----
-
-## Manual Concurrency Verification
-
-After introducing pessimistic locking, the same concurrent test was repeated.
-
-Result:
+After introducing the lock, the same concurrent test produced:
 
 ```text
-user-a → 201 Created
-user-b → 409 Conflict
-```
-
-Instead of:
-
-```text
-201
-201
-```
-
-the system now produced:
-
-```text
-201
-409
+201 Created
+409 Conflict
 ```
 
 Only one booking was persisted.
-
-This verified that pessimistic row locking prevented the observed double-booking race condition.
 
 ---
 
 ## Concurrency Testing Note
 
-Race conditions are timing-dependent and can be difficult to reproduce consistently.
-
-During the initial experiment, an artificial delay was temporarily introduced between reading the seat and updating it:
+To make the original race condition easier to reproduce, an artificial delay was temporarily introduced:
 
 ```java
 Thread.sleep(3000);
 ```
 
-The delay widened the race-condition window and made concurrent behavior easier to observe.
+The delay widened the race-condition window during development.
 
-After the race condition had been reproduced and pessimistic locking had been verified, the artificial delay was removed.
+After the race condition had been reproduced and the locking strategy verified, the delay was removed.
 
 The current booking flow contains no artificial delay.
 
 ---
 
-# Concurrent Load Testing
+# Load Testing with k6
 
-Manual two-request tests proved correctness for a small concurrency scenario, but they were not sufficient to evaluate the system under heavier contention.
+Manual concurrency tests proved correctness for two competing requests, but the next step was to evaluate the system under heavier concurrency.
 
-k6 was introduced to generate repeatable concurrent traffic and collect latency and outcome metrics.
+k6 is used to generate repeatable workloads and collect:
 
-The first load test used:
+- Booking outcome metrics
+- Latency
+- Throughput
+- Unexpected responses
 
-```text
-50 virtual users
-        │
-        ▼
-50 concurrent booking attempts
-        │
-        ▼
-The same AVAILABLE seat
-```
-
-This deliberately creates a highly contended workload.
-
-The expected result is:
-
-```text
-50 booking attempts
-        │
-        ├──── exactly 1 → 201 Created
-        │
-        └──── remaining → 409 Conflict
-```
-
----
-
-## k6 Test Scenario
-
-The test is located at:
-
-```text
-load-tests/concurrent-booking.js
-```
-
-The initial configuration:
-
-```javascript
-export const options = {
-  vus: 50,
-  iterations: 50,
-};
-```
-
-Custom metrics are used to distinguish business conflicts from actual system failures:
+Custom metrics distinguish expected business conflicts from actual failures:
 
 ```text
 booking_created
@@ -331,38 +228,13 @@ unexpected_responses
 valid_booking_response
 ```
 
-The test also defines thresholds:
-
-```javascript
-thresholds: {
-  valid_booking_response: ['rate==1'],
-  http_req_duration: ['p(95)<1000'],
-  unexpected_responses: ['count==0'],
-}
-```
-
-The current expectations are:
-
-- Every response must be either `201 Created` or `409 Conflict`.
-- No unexpected `500`, `404`, or other responses should occur.
-- The p95 response latency should remain below the current local-development threshold.
+A `409 Conflict` is an expected business outcome when another request has already claimed the seat.
 
 ---
 
-## 50-User Contention Test Results
+## 50-User Hot-Seat Test
 
-The first k6 contention test produced:
-
-```text
-booking_created.............: 1
-booking_conflict............: 49
-unexpected_responses........: 0
-valid_booking_response......: 100.00%
-```
-
-Exactly one booking succeeded.
-
-The remaining 49 booking attempts were correctly rejected.
+50 virtual users attempted to book the same seat concurrently.
 
 ```text
 50 concurrent requests
@@ -371,162 +243,190 @@ The remaining 49 booking attempts were correctly rejected.
      Same Seat
         │
    ┌────┴─────┐
-   │          │
    ▼          ▼
 1 × 201     49 × 409
 Created     Conflict
 ```
 
-No unexpected server responses occurred.
-
----
-
-## Initial Local Performance Baseline
-
-The same test produced the following latency measurements:
+Results:
 
 ```text
-Average response time : 80.36 ms
-Median response time  : 80.96 ms
-p90 response time     : 91.04 ms
-p95 response time     : 91.62 ms
-Maximum response time : 92.98 ms
+booking_created.............: 1
+booking_conflict............: 49
+unexpected_responses........: 0
+
+Average response time.......: 80.36 ms
+p95 response time...........: 91.62 ms
+Throughput..................: ~441 req/s
 ```
 
-Approximate request rate during the run:
+A database query confirmed that exactly one booking existed for the contested seat.
 
-```text
-440 requests / second
-```
-
-These values are not intended to represent production performance.
-
-The test was executed in a local development environment with:
-
-- One Spring Boot application instance
-- PostgreSQL running locally in Docker
-- 50 total booking requests
-- A single highly contended seat
-- No distributed deployment
-
-These numbers are treated only as a baseline for future architectural comparisons.
-
----
-
-## Database-Level Verification
-
-HTTP responses alone are not enough to prove correctness.
-
-After the 50-user load test, the contested seat was queried directly:
-
-```sql
-SELECT id, seat_id, user_id, status, created_at
-FROM bookings
-WHERE seat_id = 7;
-```
-
-The database contained exactly one booking:
-
-```text
- id | seat_id |  user_id  | status  |         created_at
-----+---------+-----------+---------+----------------------------
-  9 |       7 | user-13-0 | PENDING | 2026-08-17 21:25:59.001086
-
-(1 row)
-```
-
-Therefore the full experiment resulted in:
-
-```text
-50 concurrent booking attempts
-             │
-             ▼
-        HTTP Layer
-             │
-      ┌──────┴──────┐
-      ▼             ▼
-  1 Created     49 Conflicts
-      │
-      ▼
-    Database
-      │
-      ▼
-Exactly 1 booking
-```
-
-The invariant remained valid under the tested workload:
+The invariant remained valid:
 
 > At most one booking may successfully claim a seat.
 
 ---
 
-## Expected Conflict vs. System Failure
+## 100-User Hot-Seat vs Parallel-Seat Test
 
-k6 reports non-2xx responses such as `409 Conflict` as failed HTTP requests by default.
+The concurrency level was increased to 100 users.
 
-This means the contention test may show:
+Two workload patterns were compared.
 
-```text
-http_req_failed: 98%
-```
+### Hot Seat
 
-That number does not mean the application failed 98% of the time.
-
-For this workload, most conflicts are expected:
+All 100 users attempted to book the same seat.
 
 ```text
-1 × 201 Created     → expected
-49 × 409 Conflict   → expected
+1 booking created
+99 conflicts
+
+Average latency : 377.67 ms
+p95 latency     : 446.16 ms
+Throughput      : ~208 req/s
 ```
 
-For this reason, custom k6 metrics are used to separate expected business outcomes from actual application failures.
+### Parallel Seats
 
-The important metrics are:
+100 users attempted to book 100 different seats.
 
 ```text
-booking_created
-booking_conflict
-unexpected_responses
-valid_booking_response
+100 bookings created
+0 unexpected responses
+
+Average latency : 375.30 ms
+p95 latency     : 409.60 ms
+Throughput      : ~231 req/s
 ```
+
+Comparison:
+
+```text
+                   Hot Seat       Parallel Seats
+------------------------------------------------
+Average latency    377.67 ms      375.30 ms
+p95 latency        446.16 ms      409.60 ms
+Throughput         207.65 req/s   230.82 req/s
+```
+
+The parallel workload performed somewhat better, but the difference was smaller than expected.
+
+This suggested that row-lock contention contributes to latency, but does not fully explain the system behavior at higher concurrency.
 
 ---
 
-# Why Pessimistic Locking Is Not the Final Answer
+# Runtime Bottleneck Investigation
 
-Pessimistic locking currently preserves correctness, but it introduces another problem: contention.
+Spring Boot Actuator and HikariCP metrics were introduced to investigate where time was being spent under sustained load.
 
-If many users compete for the same seat:
+Relevant metrics include:
 
 ```text
-Request 1 ─────► 🔒 Seat A1
-
-Request 2 ─────► waiting...
-Request 3 ─────► waiting...
-Request 4 ─────► waiting...
-Request 5 ─────► waiting...
-Request 6 ─────► waiting...
+hikaricp.connections.active
+hikaricp.connections.idle
+hikaricp.connections.pending
+hikaricp.connections.max
+hikaricp.connections.acquire
+hikaricp.connections.usage
+hikaricp.connections.timeout
 ```
 
-The system may remain correct while latency increases and throughput decreases.
+The initial HikariCP pool size was:
 
-This introduces the next set of engineering questions:
+```text
+maximum connections = 10
+```
 
-> How does pessimistic locking behave at 100, 500, or 1000 concurrent requests?
+A sustained workload was then introduced:
 
-> What changes when users book different seats instead of the same seat?
+```text
+100 virtual users
+        │
+        ▼
+10 seconds
+        │
+        ▼
+Continuous booking requests
+```
 
-> Is the bottleneck row-lock contention, database capacity, or application throughput?
+One run produced approximately:
 
-> Would optimistic concurrency behave differently?
+```text
+41,250 requests
+~4,119 requests/second
+p95 latency: 57.01 ms
+```
 
-These questions drive the next stage of the project.
+Connection metrics showed measurable waiting during connection acquisition.
+
+This created a new hypothesis:
+
+> Would increasing the database connection pool improve throughput?
+
+---
+
+## HikariCP Pool Size Experiment
+
+The pool size was increased from:
+
+```text
+10 → 20
+```
+
+while keeping the same sustained workload.
+
+Results:
+
+```text
+                         Pool 10        Pool 20
+------------------------------------------------
+Throughput               ~4119 req/s     ~3830 req/s
+Average latency          24.15 ms       25.97 ms
+p95 latency              57.01 ms       76.82 ms
+Avg connection acquire   ~21.6 ms       ~18.65 ms
+Timeouts                 0              0
+```
+
+Increasing the pool size reduced connection acquisition time slightly, but did not improve overall performance.
+
+Throughput decreased and p95 latency increased during this run.
+
+The conclusion was not that a pool size of 10 is universally optimal.
+
+The experiment demonstrated something more important:
+
+> Increasing the number of database connections does not automatically increase application throughput.
+
+Performance decisions need to be measured rather than assumed.
+
+---
+
+## SQL Logging During Benchmarks
+
+Hibernate SQL console logging was disabled during later benchmark runs:
+
+```yaml
+spring:
+  jpa:
+    show-sql: false
+```
+
+With the pool restored to 10, another sustained workload produced approximately:
+
+```text
+Throughput       : ~4198 req/s
+Average latency  : 23.67 ms
+p95 latency      : 60.16 ms
+```
+
+The difference from the previous pool-10 run was relatively small.
+
+SQL logging therefore did not appear to be the dominant bottleneck in this local workload, but it remains disabled during performance testing to reduce benchmark noise.
 
 ---
 
 # Current Architecture
-
-The current architecture is intentionally simple:
 
 ```text
                  ┌─────────────────┐
@@ -548,6 +448,11 @@ The current architecture is intentionally simple:
                  │ BookingService  │
                  └────────┬────────┘
                           │
+                          ▼
+                 ┌─────────────────┐
+                 │    HikariCP     │
+                 └────────┬────────┘
+                          │
                ┌──────────┴──────────┐
                ▼                     ▼
        ┌──────────────┐       ┌──────────────┐
@@ -558,21 +463,18 @@ The current architecture is intentionally simple:
                           ▼
                  ┌─────────────────┐
                  │   PostgreSQL    │
-                 │                 │
                  │ SELECT ...      │
                  │ FOR UPDATE      │
                  └─────────────────┘
 ```
 
-More infrastructure will be introduced only when a demonstrated problem justifies it.
+The architecture is intentionally kept simple.
 
-Redis, Kafka, distributed coordination, retries, observability, and other components are intentionally not added prematurely.
+Redis, Kafka, distributed coordination, and other infrastructure will be introduced only when a concrete system problem requires them.
 
 ---
 
 # Current Features
-
-The system currently supports:
 
 - Event creation
 - Seat creation
@@ -585,9 +487,13 @@ The system currently supports:
 - Protection against concurrent double booking
 - Swagger / OpenAPI documentation
 - Dockerized PostgreSQL
-- k6 concurrent load testing
-- Custom booking outcome metrics
-- Latency measurement
+- k6 load testing
+- Hot-seat contention testing
+- Parallel-seat testing
+- Sustained concurrency testing
+- Spring Boot Actuator metrics
+- HikariCP connection-pool monitoring
+- Latency and throughput measurement
 - Database-level concurrency verification
 
 ---
@@ -610,16 +516,18 @@ The system currently supports:
 
 - Docker
 - Docker Compose
+- HikariCP
 
 ## API
 
 - REST
-- OpenAPI
-- Swagger UI
+- OpenAPI / Swagger
 
-## Performance Testing
+## Performance & Diagnostics
 
 - k6
+- Spring Boot Actuator
+- Micrometer
 
 ## Planned
 
@@ -650,16 +558,25 @@ Pessimistic Row Locking
 Verify Concurrent Correctness
           │
           ▼
-Remove Artificial Test Delay
-          │
-          ▼
 k6 Concurrent Load Testing
           │
           ▼
-Hot-Seat Contention Testing        ← CURRENT
+Hot-Seat Testing
           │
           ▼
 Parallel Multi-Seat Testing
+          │
+          ▼
+Sustained Load Testing
+          │
+          ▼
+Runtime Metrics
+          │
+          ▼
+HikariCP Investigation
+          │
+          ▼
+Runtime / Database Bottleneck Analysis   ← CURRENT
           │
           ▼
 Optimistic Concurrency
@@ -680,7 +597,10 @@ Kafka & Event-Driven Processing
 Failure Handling
           │
           ▼
-Observability
+Prometheus & Grafana
+          │
+          ▼
+Integration & Concurrency Testing
           │
           ▼
 Performance & Scalability Testing
@@ -690,103 +610,51 @@ Performance & Scalability Testing
 
 # Current Findings
 
-The experiments performed so far demonstrate several important properties of the system.
+The experiments performed so far demonstrate several important properties of the system:
 
-### Sequential correctness does not guarantee concurrent correctness
-
-The initial booking flow behaved correctly when requests arrived sequentially but allowed double booking under concurrent execution.
-
-### The race condition can be reproduced
-
-Concurrent requests successfully demonstrated that two transactions could observe the same seat as `AVAILABLE`.
-
-### PostgreSQL pessimistic locking prevents the observed double booking
-
-Using a pessimistic write lock serializes competing transactions for the same seat.
-
-### Business conflicts are not the same as system failures
-
-A `409 Conflict` is an expected outcome when another transaction has already claimed the seat.
-
-### The booking invariant holds under the current tested workload
-
-With 50 concurrent booking attempts against the same seat:
-
-```text
-1 successful booking
-49 booking conflicts
-0 unexpected responses
-1 persisted booking
-```
-
-The system remained correct.
+- Sequential correctness does not guarantee concurrent correctness.
+- PostgreSQL pessimistic locking prevents the reproduced double-booking race condition.
+- Expected booking conflicts must be distinguished from actual server failures.
+- Hot-seat contention affects latency and throughput, but row-lock contention is not the only performance factor.
+- Database connection acquisition introduces measurable waiting under sustained concurrency.
+- Increasing HikariCP from 10 to 20 connections did not improve the tested workload.
+- Performance changes should be validated with controlled experiments rather than assumptions.
 
 ---
 
 # Next Milestone
 
-The next stage is to compare two different workload patterns.
-
-## Scenario 1 — Hot Seat
-
-Many users compete for the same seat:
+The next step is to continue identifying where time is spent under concurrency.
 
 ```text
-50 / 100 / 500 / 1000 users
-              │
-              ▼
-           Seat A1
-              │
-              ▼
-       Heavy contention
+Incoming Request
+       │
+       ▼
+Spring / Tomcat
+       │
+       ▼
+Transaction
+       │
+       ▼
+HikariCP
+       │
+       ▼
+PostgreSQL
+       │
+       ├── Query execution
+       ├── Transaction overhead
+       └── Row-lock waiting
 ```
 
-This scenario stresses the pessimistic locking strategy.
-
-Metrics of interest:
-
-- Successful bookings
-- Conflict count
-- Unexpected failures
-- Average latency
-- p95 latency
-- p99 latency
-- Throughput
-
-## Scenario 2 — Parallel Seats
-
-Users attempt to book different seats:
-
-```text
-User 1 ─────► Seat A1
-User 2 ─────► Seat A2
-User 3 ─────► Seat A3
-User 4 ─────► Seat A4
-   ...           ...
-```
-
-This workload introduces far less row-level contention.
-
-Comparing both scenarios will help separate:
-
-```text
-General application/database cost
-              │
-              ├────────► Lock contention cost
-              │
-              ▼
-        Measured behavior
-```
-
-The results will guide future concurrency and architecture decisions.
+Once the current baseline is understood more clearly, Tickera will introduce optimistic concurrency and compare it with pessimistic locking under equivalent workloads.
 
 ---
 
 # Project Philosophy
 
-Tickera is intentionally not developed by adding technologies just because they are commonly associated with distributed systems.
+Tickera is intentionally not developed by adding technologies simply because they are commonly associated with distributed systems.
 
-Each architectural component should answer a concrete engineering problem.
+Each architectural decision should answer a concrete engineering problem.
 
 ```text
 Problem

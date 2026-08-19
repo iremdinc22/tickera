@@ -1,5 +1,5 @@
 import http from 'k6/http';
-import { check } from 'k6';
+import { check, sleep } from 'k6';
 import { Counter, Rate } from 'k6/metrics';
 import exec from 'k6/execution';
 
@@ -11,16 +11,18 @@ const validBookingResponse = new Rate('valid_booking_response');
 
 export const options = {
   scenarios: {
-    parallel_load: {
-      executor: 'shared-iterations',
+    sustained_load: {
+      executor: 'constant-arrival-rate',
 
-      // Aynı anda en fazla 100 kullanıcı
-      vus: 100,
+      // Saniyede 10 yeni booking attempt
+      rate: 10,
+      timeUnit: '1s',
 
-      // Toplam 500 request = 500 farklı seat
-      iterations: 500,
+      // 30 saniye boyunca devam et
+      duration: '30s',
 
-      maxDuration: '30s',
+      preAllocatedVUs: 20,
+      maxVUs: 100,
     },
   },
 
@@ -32,31 +34,28 @@ export const options = {
 };
 
 export default function () {
-
-  // Load-test event:
-  // Seat IDs: 513 - 1012
-  const firstSeatId = 513;
-
-  // Her iteration benzersiz seat kullanır:
-  // 0 -> 513
-  // 1 -> 514
-  // ...
-  // 499 -> 1012
+  // Sustained Load Event
+  // Seat IDs: 1013 - 2012
+  const firstSeatId = 2013;
+  const totalSeats = 1000;
+  
   const iteration = exec.scenario.iterationInTest;
-  const seatId = firstSeatId + iteration;
+
+  // 1000 seat içinde sırayla ilerle
+  const seatOffset = iteration % totalSeats;
+  const seatId = firstSeatId + seatOffset;
 
   const payload = JSON.stringify({
     seatId,
-    userId: `parallel-user-${iteration}`,
+    userId: `sustained-user-${iteration}`,
   });
 
   const params = {
     headers: {
       'Content-Type': 'application/json',
     },
-
     tags: {
-      endpoint: 'parallel-booking',
+      endpoint: 'sustained-booking',
     },
   };
 
@@ -69,11 +68,9 @@ export default function () {
   if (response.status === 201) {
     bookingCreated.add(1);
     validBookingResponse.add(true);
-
   } else if (response.status === 409) {
     bookingConflict.add(1);
     validBookingResponse.add(true);
-
   } else {
     unexpectedResponses.add(1);
     validBookingResponse.add(false);
@@ -83,4 +80,6 @@ export default function () {
     'booking response is valid': (r) =>
       r.status === 201 || r.status === 409,
   });
+
+  sleep(0.1);
 }

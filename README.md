@@ -35,11 +35,11 @@ Infrastructure is introduced only when a demonstrated engineering problem justif
 
 ---
 
-## The Core Problem
+# The Core Problem
 
 Consider the last available seat for a concert.
 
-Two users attempt to book the same seat at nearly the same time:
+Two users attempt to book the same seat nearly simultaneously:
 
 ```text
 User A                         User B
@@ -78,7 +78,7 @@ Both transactions may observe the same seat as `AVAILABLE` before either transac
 
 ---
 
-## System Invariant
+# System Invariant
 
 The first concurrency invariant defined for Tickera is:
 
@@ -94,7 +94,7 @@ The first phase of the project therefore focused on:
 
 ---
 
-## Reproducing the Race Condition
+# Reproducing the Race Condition
 
 Two booking requests were sent concurrently for the same seat.
 
@@ -134,7 +134,7 @@ Sequential correctness was not enough.
 
 ---
 
-## First Solution — Pessimistic Row Locking
+# First Solution — Pessimistic Row Locking
 
 The first concurrency strategy implemented in Tickera is database-level pessimistic locking.
 
@@ -175,7 +175,7 @@ UPDATE BOOKED                       │
 CREATE BOOKING                      │
 COMMIT 🔓                            │
                                      ▼
-                               READ BOOKED
+                                READ BOOKED
                                      │
                                      ▼
                                 409 Conflict
@@ -192,7 +192,7 @@ Only one booking was persisted.
 
 ---
 
-## Concurrency Testing Note
+# Concurrency Testing Note
 
 To make the original race condition easier to reproduce, an artificial delay was temporarily introduced:
 
@@ -312,13 +312,13 @@ Throughput         207.65 req/s   230.82 req/s
 
 The parallel workload performed somewhat better, but the difference was smaller than expected.
 
-This suggested that row-lock contention contributes to latency, but does not fully explain the system behavior at higher concurrency.
+This suggested that row-lock contention contributes to latency, but does not fully explain system behavior at higher concurrency.
 
 ---
 
 # Runtime Bottleneck Investigation
 
-Spring Boot Actuator and HikariCP metrics were introduced to investigate where time was being spent under sustained load.
+Spring Boot Actuator and HikariCP metrics were introduced to investigate where time was being spent under load.
 
 Relevant metrics include:
 
@@ -338,22 +338,10 @@ The initial HikariCP pool size was:
 maximum connections = 10
 ```
 
-A sustained workload was then introduced:
+A high-throughput sustained workload produced approximately:
 
 ```text
-100 virtual users
-        │
-        ▼
-10 seconds
-        │
-        ▼
-Continuous booking requests
-```
-
-One run produced approximately:
-
-```text
-41,250 requests
+~41,250 requests
 ~4,119 requests/second
 p95 latency: 57.01 ms
 ```
@@ -366,7 +354,7 @@ This created a new hypothesis:
 
 ---
 
-## HikariCP Pool Size Experiment
+# HikariCP Pool Size Experiment
 
 The pool size was increased from:
 
@@ -374,7 +362,7 @@ The pool size was increased from:
 10 → 20
 ```
 
-while keeping the same sustained workload.
+while keeping the workload equivalent.
 
 Results:
 
@@ -382,19 +370,19 @@ Results:
                          Pool 10        Pool 20
 ------------------------------------------------
 Throughput               ~4119 req/s     ~3830 req/s
-Average latency          24.15 ms       25.97 ms
-p95 latency              57.01 ms       76.82 ms
-Avg connection acquire   ~21.6 ms       ~18.65 ms
-Timeouts                 0              0
+Average latency          24.15 ms        25.97 ms
+p95 latency              57.01 ms        76.82 ms
+Avg connection acquire   ~21.6 ms        ~18.65 ms
+Timeouts                 0               0
 ```
 
 Increasing the pool size reduced connection acquisition time slightly, but did not improve overall performance.
 
 Throughput decreased and p95 latency increased during this run.
 
-The conclusion was not that a pool size of 10 is universally optimal.
+The conclusion is not that a pool size of 10 is universally optimal.
 
-The experiment demonstrated something more important:
+Instead, the experiment demonstrates something more important:
 
 > Increasing the number of database connections does not automatically increase application throughput.
 
@@ -402,7 +390,7 @@ Performance decisions need to be measured rather than assumed.
 
 ---
 
-## SQL Logging During Benchmarks
+# SQL Logging During Benchmarks
 
 Hibernate SQL console logging was disabled during later benchmark runs:
 
@@ -412,7 +400,7 @@ spring:
     show-sql: false
 ```
 
-With the pool restored to 10, another sustained workload produced approximately:
+With the pool restored to 10, another high-throughput workload produced approximately:
 
 ```text
 Throughput       : ~4198 req/s
@@ -426,49 +414,163 @@ SQL logging therefore did not appear to be the dominant bottleneck in this local
 
 ---
 
+# Prometheus & Grafana Observability
+
+After the initial performance investigation, Prometheus and Grafana were introduced to make runtime behavior observable during load tests.
+
+Spring Boot Actuator exposes application metrics through Micrometer, which are scraped by Prometheus and visualized through Grafana.
+
+```text
+Spring Boot
+     │
+     ▼
+  Actuator
+     │
+     ▼
+ Micrometer
+     │
+     ▼
+ Prometheus
+     │
+     ▼
+  Grafana
+```
+
+The Tickera observability dashboard currently tracks:
+
+- HikariCP active connections
+- HikariCP idle connections
+- HikariCP pending connections
+- HikariCP maximum connections
+- HTTP request rate
+- Booking API p95 latency
+- JVM heap memory usage
+- CPU usage
+
+This makes it possible to correlate incoming traffic with application latency, JVM resource usage, and database connection-pool utilization.
+
+---
+
+## Controlled Sustained-Load Observation
+
+A lower-rate workload was introduced specifically to observe the application over a longer period rather than maximize throughput.
+
+The workload was configured at:
+
+```text
+10 requests/second
+30 seconds
+```
+
+A representative run produced:
+
+```text
+Requests completed : 300
+Request rate       : ~10 req/s
+Failures           : 0
+Average latency    : 15.83 ms
+p95 latency        : 23.65 ms
+Maximum latency    : 468.52 ms
+```
+
+All 300 booking requests completed successfully.
+
+During the same workload, Grafana showed approximately:
+
+```text
+HikariCP max connections     : 10
+HikariCP active connections  : 0–1
+HikariCP idle connections    : 9–10
+HikariCP pending connections : 0
+```
+
+The pool remained largely underutilized.
+
+At this workload level, the application generally required no more than one database connection at a time and no requests were observed waiting for a connection.
+
+Therefore:
+
+> The HikariCP connection pool was not a bottleneck under the tested 10 req/s sustained booking workload.
+
+This result does not contradict the earlier high-throughput HikariCP experiments.
+
+The workloads answer different questions:
+
+```text
+High-throughput benchmark
+        │
+        └── How does the system behave near much heavier load?
+
+Controlled sustained workload
+        │
+        └── What does normal runtime resource utilization look like
+            at a fixed 10 req/s?
+```
+
+The experiments reinforce an important performance-engineering principle:
+
+> Bottlenecks are workload-dependent and should be identified through measurement rather than assumption.
+
+---
+
 # Current Architecture
 
 ```text
-                 ┌─────────────────┐
-                 │     Client      │
-                 └────────┬────────┘
-                          │
-                          ▼
-                 ┌─────────────────┐
-                 │    REST API     │
-                 └────────┬────────┘
-                          │
-                          ▼
-                 ┌─────────────────┐
-                 │BookingController│
-                 └────────┬────────┘
-                          │
-                          ▼
-                 ┌─────────────────┐
-                 │ BookingService  │
-                 └────────┬────────┘
-                          │
-                          ▼
-                 ┌─────────────────┐
-                 │    HikariCP     │
-                 └────────┬────────┘
-                          │
-               ┌──────────┴──────────┐
-               ▼                     ▼
-       ┌──────────────┐       ┌──────────────┐
-       │SeatRepository│       │BookingRepo   │
-       └───────┬──────┘       └───────┬──────┘
-               │                      │
-               └──────────┬───────────┘
-                          ▼
-                 ┌─────────────────┐
-                 │   PostgreSQL    │
-                 │ SELECT ...      │
-                 │ FOR UPDATE      │
-                 └─────────────────┘
+                    ┌─────────────────┐
+                    │     Client      │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │    REST API     │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │BookingController│
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │ BookingService  │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │    HikariCP     │
+                    └────────┬────────┘
+                             │
+                  ┌──────────┴──────────┐
+                  ▼                     ▼
+          ┌──────────────┐       ┌──────────────┐
+          │SeatRepository│       │BookingRepo   │
+          └───────┬──────┘       └───────┬──────┘
+                  │                      │
+                  └──────────┬───────────┘
+                             ▼
+                    ┌─────────────────┐
+                    │   PostgreSQL    │
+                    │ SELECT ...      │
+                    │ FOR UPDATE      │
+                    └─────────────────┘
 ```
 
-The architecture is intentionally kept simple.
+Observability runs alongside the application:
+
+```text
+Spring Boot Actuator
+        │
+        ▼
+    Micrometer
+        │
+        ▼
+    Prometheus
+        │
+        ▼
+     Grafana
+```
+
+The core architecture remains intentionally simple.
 
 Redis, Kafka, distributed coordination, and other infrastructure will be introduced only when a concrete system problem requires them.
 
@@ -490,10 +592,16 @@ Redis, Kafka, distributed coordination, and other infrastructure will be introdu
 - k6 load testing
 - Hot-seat contention testing
 - Parallel-seat testing
-- Sustained concurrency testing
+- Sustained load testing
 - Spring Boot Actuator metrics
+- Micrometer metrics
 - HikariCP connection-pool monitoring
-- Latency and throughput measurement
+- Prometheus metrics scraping
+- Grafana observability dashboard
+- HTTP request-rate monitoring
+- Booking API p95 latency monitoring
+- JVM memory monitoring
+- CPU monitoring
 - Database-level concurrency verification
 
 ---
@@ -523,19 +631,19 @@ Redis, Kafka, distributed coordination, and other infrastructure will be introdu
 - REST
 - OpenAPI / Swagger
 
-## Performance & Diagnostics
+## Performance & Observability
 
 - k6
 - Spring Boot Actuator
 - Micrometer
+- Prometheus
+- Grafana
 
 ## Planned
 
 - Testcontainers
 - Redis
 - Kafka
-- Prometheus
-- Grafana
 - GitHub Actions
 
 ---
@@ -576,10 +684,13 @@ Runtime Metrics
 HikariCP Investigation
           │
           ▼
-Runtime / Database Bottleneck Analysis   ← CURRENT
+Runtime / Database Bottleneck Analysis
           │
           ▼
-Optimistic Concurrency
+Prometheus & Grafana Observability
+          │
+          ▼
+Optimistic Concurrency                 ← NEXT
           │
           ▼
 Compare Concurrency Strategies
@@ -595,9 +706,6 @@ Kafka & Event-Driven Processing
           │
           ▼
 Failure Handling
-          │
-          ▼
-Prometheus & Grafana
           │
           ▼
 Integration & Concurrency Testing
@@ -616,37 +724,56 @@ The experiments performed so far demonstrate several important properties of the
 - PostgreSQL pessimistic locking prevents the reproduced double-booking race condition.
 - Expected booking conflicts must be distinguished from actual server failures.
 - Hot-seat contention affects latency and throughput, but row-lock contention is not the only performance factor.
-- Database connection acquisition introduces measurable waiting under sustained concurrency.
-- Increasing HikariCP from 10 to 20 connections did not improve the tested workload.
+- Database connection acquisition can introduce measurable waiting under sufficiently heavy concurrency.
+- Increasing HikariCP from 10 to 20 connections did not improve the tested high-throughput workload.
+- Increasing connection-pool size does not automatically increase application throughput.
+- Under a controlled 10 req/s sustained workload, HikariCP remained largely underutilized with no pending connection requests.
+- The 10-connection pool was therefore not a bottleneck at that workload level.
+- Prometheus and Grafana make it possible to correlate application traffic with HTTP latency, JVM utilization, and connection-pool behavior.
+- Performance bottlenecks depend on workload characteristics.
 - Performance changes should be validated with controlled experiments rather than assumptions.
 
 ---
 
-# Next Milestone
+# Next Milestone — Optimistic Concurrency
 
-The next step is to continue identifying where time is spent under concurrency.
+The current pessimistic-locking implementation provides a correctness baseline.
+
+The next step is to implement optimistic concurrency and compare both strategies under equivalent workloads.
+
+The comparison will focus on:
 
 ```text
-Incoming Request
-       │
-       ▼
-Spring / Tomcat
-       │
-       ▼
-Transaction
-       │
-       ▼
-HikariCP
-       │
-       ▼
-PostgreSQL
-       │
-       ├── Query execution
-       ├── Transaction overhead
-       └── Row-lock waiting
+                    Pessimistic       Optimistic
+                    Locking           Concurrency
+                         │                 │
+                         ├──────┬──────────┤
+                                │
+                                ▼
+                         Correctness
+                                │
+                                ▼
+                            Latency
+                                │
+                                ▼
+                           Throughput
+                                │
+                                ▼
+                       Conflict Behavior
 ```
 
-Once the current baseline is understood more clearly, Tickera will introduce optimistic concurrency and compare it with pessimistic locking under equivalent workloads.
+The goal is not simply to determine which strategy is "faster."
+
+Instead, the experiment should identify the trade-offs between:
+
+- Lock waiting
+- Conflict frequency
+- Retry behavior
+- Latency
+- Throughput
+- Implementation complexity
+
+under equivalent concurrency patterns.
 
 ---
 

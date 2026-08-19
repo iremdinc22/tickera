@@ -1,15 +1,43 @@
 services:
+
   postgres:
     image: postgres:17
     container_name: tickera-postgres
+
     environment:
       POSTGRES_DB: tickera
       POSTGRES_USER: tickera
       POSTGRES_PASSWORD: tickera
+
     ports:
       - "5436:5432"
+
     volumes:
       - tickera_postgres_data:/var/lib/postgresql/data
 
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: tickera-prometheus
+
+    ports:
+      - "9090:9090"
+
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: tickera-grafana
+
+    ports:
+      - "3000:3000"
+
+    volumes:
+      - tickera_grafana_data:/var/lib/grafana
+
 volumes:
   tickera_postgres_data:
+  tickera_grafana_data:

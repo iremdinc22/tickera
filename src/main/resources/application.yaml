@@ -6,6 +6,7 @@ spring:
     url: jdbc:postgresql://localhost:5436/tickera
     username: tickera
     password: tickera
+
     hikari:
       maximum-pool-size: 10
 
@@ -13,6 +14,11 @@ spring:
     hibernate:
       ddl-auto: update
     show-sql: false
+
+server:
+  tomcat:
+    mbeanregistry:
+      enabled: true
 
 management:
   endpoints:

@@ -55,6 +55,7 @@ UPDATE BOOKED                  UPDATE BOOKED
    │                              │
    ▼                              ▼
 CREATE BOOKING                 CREATE BOOKING
+
               💥 DOUBLE BOOKING
 ```
 
@@ -68,7 +69,6 @@ if (seat.getStatus() != SeatStatus.AVAILABLE) {
 }
 
 seat.setStatus(SeatStatus.BOOKED);
-
 bookingRepository.save(booking);
 ```
 
@@ -254,6 +254,7 @@ Results:
 booking_created.............: 1
 booking_conflict............: 49
 unexpected_responses........: 0
+
 Average response time.......: 80.36 ms
 p95 response time...........: 91.62 ms
 Throughput..................: ~441 req/s
@@ -373,7 +374,7 @@ SQL logging therefore did not appear to be the dominant bottleneck in this local
 
 # Prometheus & Grafana Observability
 
-After the initial performance investigation, Prometheus and Grafana were introduced to make runtime behavior observable during load tests.
+Prometheus and Grafana were introduced to make runtime behavior observable during load tests.
 
 Spring Boot Actuator exposes application metrics through Micrometer, which are scraped by Prometheus and visualized through Grafana.
 
@@ -393,7 +394,7 @@ Spring Boot
   Grafana
 ```
 
-The Tickera observability dashboard currently tracks:
+The Tickera observability dashboard tracks:
 
 - HikariCP active connections
 - HikariCP idle connections
@@ -403,12 +404,18 @@ The Tickera observability dashboard currently tracks:
 - Booking API p95 latency
 - JVM heap memory usage
 - CPU usage
+- Tomcat busy threads
+- Tomcat current threads
+- Tomcat maximum threads
+- Booking transaction duration
+- Seat-lock duration
+- Booking persistence duration
 
-This makes it possible to correlate incoming traffic with application latency, JVM resource usage, and database connection-pool utilization.
+This makes it possible to correlate incoming traffic with application latency, JVM utilization, HTTP worker threads, transaction timing, and database connection-pool behavior.
 
 ---
 
-## Controlled Sustained-Load Observation
+# Controlled Sustained-Load Observation
 
 A lower-rate workload was introduced specifically to observe the application over a longer period rather than maximize throughput.
 
@@ -430,8 +437,6 @@ p95 latency        : 23.65 ms
 Maximum latency    : 468.52 ms
 ```
 
-All 300 booking requests completed successfully.
-
 During the same workload, Grafana showed approximately:
 
 ```text
@@ -442,8 +447,6 @@ HikariCP pending connections : 0
 ```
 
 The pool remained largely underutilized.
-
-At this workload level, the application generally required no more than one database connection at a time and no requests were observed waiting for a connection.
 
 Therefore:
 
@@ -480,7 +483,7 @@ Requested Rate      Observed Behavior
 2000 req/s          Clear saturation signals
 ```
 
-The tests showed that the earlier failed 100 req/s run was not a reproducible system capacity boundary.
+The tests showed that an earlier failed 100 req/s run was not a reproducible system capacity boundary.
 
 A repeated 100 req/s run completed successfully:
 
@@ -492,7 +495,7 @@ Average latency    : 3.92 ms
 p95 latency        : 8.37 ms
 ```
 
-This reinforced another important performance-testing principle:
+This reinforced an important performance-testing principle:
 
 > A single anomalous benchmark run should not automatically be treated as a system limit. Results should be reproducible.
 
@@ -500,7 +503,7 @@ This reinforced another important performance-testing principle:
 
 # 2000 req/s Capacity Observation
 
-At 2000 requested iterations per second with the default HikariCP pool size of 10, the system produced:
+At 2000 requested iterations per second with the default HikariCP pool size of 10, a representative run produced:
 
 ```text
 Requested rate       : 2000 req/s
@@ -523,7 +526,7 @@ HikariCP idle connections    : 0
 HikariCP pending connections : > 0
 ```
 
-These metrics indicate that requests had begun waiting for database connections.
+These metrics indicated that requests had begun waiting for database connections.
 
 However, pool saturation alone does not prove that the pool is undersized.
 
@@ -557,31 +560,14 @@ Dropped iterations       559              1642
 HTTP failures            0%               0%
 ```
 
-During the pool-20 run, Grafana showed:
-
-```text
-HikariCP active connections  : 20 / 20
-HikariCP idle connections    : 0 at peak
-HikariCP pending connections : significant spike
-```
-
-k6 also reported:
-
-```text
-Insufficient VUs, reached 500 active VUs and cannot initialize more
-```
-
-The test generator therefore reached its configured `maxVUs` limit while attempting to maintain the requested arrival rate.
-
-More importantly, increasing the database connection pool did not improve application performance.
+Increasing the database connection pool did not improve application performance.
 
 Instead:
 
 - Achieved throughput decreased
 - Average latency increased
-- p95 latency increased from `93.11 ms` to `260.04 ms`
-- Maximum latency increased to `1.39 s`
-- Dropped iterations increased from `559` to `1642`
+- p95 latency increased
+- Dropped iterations increased
 - Connection-pool waiting remained visible
 
 The simple hypothesis that the system only needed more database connections was therefore rejected.
@@ -594,7 +580,237 @@ The HikariCP pool size was restored to:
 maximum-pool-size: 10
 ```
 
-This keeps the application on the original baseline configuration while the underlying bottleneck is investigated.
+---
+
+# Deeper Bottleneck Investigation
+
+Because increasing the connection pool did not resolve the degradation near system capacity, the investigation moved deeper into PostgreSQL, transaction timing, the HTTP server, and the load generator itself.
+
+## PostgreSQL Query Analysis
+
+`pg_stat_statements` was enabled to inspect database execution under the booking workload.
+
+A representative high-load run showed:
+
+```text
+Query                                  Calls      Mean Execution
+----------------------------------------------------------------
+INSERT booking                         ~59k       ~0.082 ms
+UPDATE seat                            ~59k       ~0.063 ms
+SELECT seat FOR NO KEY UPDATE          ~59k       ~0.031 ms
+```
+
+Individual SQL statements were therefore very fast.
+
+This suggested that raw SQL execution time alone was not sufficient to explain the much larger end-to-end HTTP latency observed near saturation.
+
+---
+
+## WAL and Synchronous Commit Experiment
+
+Because every successful booking modifies persistent state, PostgreSQL Write-Ahead Logging (WAL) was investigated.
+
+WAL I/O timing was enabled and WAL statistics were measured before and after a high-load run.
+
+The experiment showed measurable WAL synchronization activity.
+
+To test whether synchronous WAL commits were a dominant source of latency, the following setting was temporarily changed:
+
+```text
+synchronous_commit
+
+ON → OFF
+```
+
+The same workload was then repeated.
+
+Disabling synchronous commit reduced WAL synchronization cost, but did not produce a corresponding improvement in overall application throughput or p95 latency.
+
+The setting was restored after the experiment.
+
+Therefore:
+
+> Synchronous WAL flushes contribute to database work, but they were not identified as the primary cause of the observed capacity degradation.
+
+---
+
+## Application-Level Timing
+
+Custom Micrometer timers were added around important parts of the booking flow:
+
+```text
+booking_seat_lock_duration
+booking_save_duration
+booking_flush_duration
+booking_transaction_duration
+```
+
+These metrics make it possible to compare time spent inside the booking transaction with end-to-end HTTP latency.
+
+Together with `pg_stat_statements`, the measurements reinforced an important observation:
+
+> Large end-to-end latency under saturation cannot be explained by individual SQL execution time alone.
+
+---
+
+# Tomcat Thread-Pool Investigation
+
+Tomcat worker-thread metrics were exposed through Spring Boot Actuator and monitored in Grafana.
+
+During one 2000 req/s run with the default configuration:
+
+```text
+Tomcat busy threads    : 200
+Tomcat current threads : 200
+Tomcat max threads     : 200
+```
+
+This initially suggested that the Tomcat worker-thread limit might be restricting throughput.
+
+To test the hypothesis, the maximum thread count was temporarily increased:
+
+```text
+200 → 400
+```
+
+The same workload was repeated.
+
+```text
+                         200 threads      400 threads
+------------------------------------------------------
+Achieved throughput      ~1917 req/s       ~1918 req/s
+Average latency          70.25 ms          67.06 ms
+p95 latency              332.83 ms         293.94 ms
+Dropped iterations       2440              1864
+HTTP failures            0%                0%
+```
+
+With the larger pool, Tomcat thread saturation disappeared during the observed run, but throughput remained almost unchanged.
+
+Therefore:
+
+> The default 200-thread Tomcat limit was not identified as the primary throughput bottleneck.
+
+The experimental thread configuration was reverted after the test.
+
+---
+
+# k6 VU-Limit Investigation
+
+During several capacity tests, k6 reported:
+
+```text
+Insufficient VUs, reached 500 active VUs and cannot initialize more
+```
+
+This raised another hypothesis:
+
+> Is the load generator's 500-VU limit preventing k6 from sustaining 2000 req/s?
+
+To test this, k6 was temporarily changed from:
+
+```text
+preAllocatedVUs: 100
+maxVUs: 500
+```
+
+to:
+
+```text
+preAllocatedVUs: 500
+maxVUs: 1000
+```
+
+The 2000 req/s workload was repeated.
+
+Results:
+
+```text
+                         maxVUs 500       maxVUs 1000
+------------------------------------------------------
+Achieved throughput      ~1917 req/s       ~1710 req/s
+Average latency          ~70 ms            ~475 ms
+p95 latency              ~333 ms           ~917 ms
+Dropped iterations       2440              8016
+HTTP failures            0%                0%
+```
+
+k6 eventually reached the new 1000-VU limit as well.
+
+Providing additional concurrency therefore did not increase achieved throughput.
+
+Instead:
+
+```text
+More concurrency
+       │
+       ▼
+Longer request duration
+       │
+       ▼
+More requests in flight
+       │
+       ▼
+Higher latency
+       │
+       ▼
+No additional throughput
+```
+
+The original 500-VU limit was therefore not identified as the underlying cause of the observed capacity boundary.
+
+The result is consistent with system saturation: adding more concurrency after a certain point increases waiting rather than useful throughput.
+
+---
+
+# Capacity Investigation Conclusion
+
+The performance investigation tested several plausible bottlenecks independently:
+
+```text
+HikariCP connections
+10 → 20
+      │
+      └── No throughput improvement
+
+PostgreSQL synchronous commit
+ON → OFF
+      │
+      └── No material application-level improvement
+
+Tomcat worker threads
+200 → 400
+      │
+      └── Saturation disappeared,
+          throughput remained similar
+
+k6 maxVUs
+500 → 1000
+      │
+      └── Throughput decreased,
+          latency increased
+```
+
+No single configuration parameter tested so far fully explains the observed capacity boundary.
+
+Instead, the experiments demonstrate that near 2000 req/s the local system enters a saturation regime where additional concurrency increases latency and waiting without increasing useful throughput.
+
+These numbers should not be interpreted as production capacity measurements.
+
+The complete benchmark environment runs locally and includes:
+
+```text
+k6
+Spring Boot JVM
+PostgreSQL
+Docker
+Prometheus
+Grafana
+```
+
+All components therefore compete for resources on the same development machine.
+
+The purpose of these experiments is not to claim a production throughput number, but to practice controlled performance investigation and understand how bottlenecks appear across application layers.
 
 ---
 
@@ -603,10 +819,12 @@ This keeps the application on the original baseline configuration while the unde
 ```text
                     ┌─────────────────┐
                     │     Client      │
+                    │      / k6       │
                     └────────┬────────┘
                              │
                              ▼
                     ┌─────────────────┐
+                    │     Tomcat      │
                     │    REST API     │
                     └────────┬────────┘
                              │
@@ -680,14 +898,18 @@ Redis, Kafka, distributed coordination, and other infrastructure will be introdu
 - Sustained load testing
 - Capacity testing
 - Spring Boot Actuator metrics
-- Micrometer metrics
+- Micrometer custom timers
 - HikariCP connection-pool monitoring
 - Prometheus metrics scraping
 - Grafana observability dashboard
 - HTTP request-rate monitoring
 - Booking API p95 latency monitoring
+- Tomcat thread monitoring
+- Booking transaction timing
 - JVM memory monitoring
 - CPU monitoring
+- PostgreSQL `pg_stat_statements`
+- PostgreSQL WAL investigation
 - Database-level concurrency verification
 
 ---
@@ -705,12 +927,14 @@ Redis, Kafka, distributed coordination, and other infrastructure will be introdu
 ## Database
 
 - PostgreSQL 17
+- pg_stat_statements
 
 ## Infrastructure
 
 - Docker
 - Docker Compose
 - HikariCP
+- Tomcat
 
 ## API
 
@@ -767,9 +991,6 @@ Sustained Load Testing
 Runtime Metrics
           │
           ▼
-HikariCP Investigation
-          │
-          ▼
 Prometheus & Grafana Observability
           │
           ▼
@@ -779,10 +1000,19 @@ Capacity Testing
 HikariCP Saturation Investigation
           │
           ▼
-PostgreSQL Root-Cause Analysis              ← NEXT
+PostgreSQL Query & WAL Analysis
           │
           ▼
-Optimistic Concurrency
+Application Timing Instrumentation
+          │
+          ▼
+Tomcat Thread-Pool Investigation
+          │
+          ▼
+Load-Generator Limit Investigation
+          │
+          ▼
+Optimistic Concurrency                 ← NEXT
           │
           ▼
 Compare Concurrency Strategies
@@ -813,65 +1043,82 @@ Performance & Scalability Testing
 The experiments performed so far demonstrate several important properties of the system:
 
 - Sequential correctness does not guarantee concurrent correctness.
+
 - PostgreSQL pessimistic locking prevents the reproduced double-booking race condition.
+
 - Expected booking conflicts must be distinguished from actual server failures.
+
 - Hot-seat contention affects latency and throughput, but row-lock contention is not the only performance factor.
+
 - Under low sustained load, the HikariCP connection pool remains largely underutilized.
-- Capacity testing must be repeated before treating a single anomalous result as a system limit.
-- As the booking workload approaches system capacity, HikariCP saturation becomes visible through active, idle, and pending connection metrics.
-- At 2000 requested req/s, the 10-connection pool reached full utilization and requests began waiting for database connections.
-- Increasing HikariCP from 10 to 20 connections did not resolve the observed bottleneck.
-- Under the same 2000 req/s workload, the larger pool increased latency and dropped iterations while reducing achieved throughput.
-- Connection-pool saturation therefore appears to be a symptom rather than sufficient evidence that the pool itself is undersized.
-- Prometheus and Grafana make it possible to correlate application traffic with HTTP latency, JVM utilization, and connection-pool behavior.
-- Performance bottlenecks depend on workload characteristics.
-- Performance changes should be validated with controlled experiments rather than assumptions.
-- Further investigation is required at the PostgreSQL query and transaction level.
+
+- As the workload approaches local system capacity, connection waiting, latency, and dropped iterations become visible.
+
+- Increasing HikariCP from 10 to 20 connections did not improve throughput and increased latency in the tested workload.
+
+- `pg_stat_statements` showed that individual booking SQL statements execute very quickly, so raw query execution time alone does not explain end-to-end latency.
+
+- Disabling synchronous commit reduced WAL synchronization cost but did not materially improve application-level performance.
+
+- Increasing Tomcat's worker-thread limit from 200 to 400 removed the observed thread-pool saturation without materially increasing throughput.
+
+- Increasing k6 `maxVUs` from 500 to 1000 did not increase achieved throughput. Instead, latency and dropped iterations increased significantly.
+
+- The observed local capacity boundary is therefore not explained by a single connection-pool, Tomcat-thread, WAL, or k6 VU configuration limit.
+
+- Additional concurrency can reduce performance once the system enters saturation.
+
+- Performance bottlenecks emerge from interactions between multiple layers and should be investigated through controlled experiments rather than assumptions.
+
+- Local benchmark results should not be interpreted as production capacity because the load generator, application, database, observability stack, and Docker runtime share the same machine.
 
 ---
 
-# Next Milestone — PostgreSQL Bottleneck Analysis
+# Next Milestone — Optimistic Concurrency
 
-Capacity testing revealed that increasing the HikariCP connection pool does not resolve the performance degradation observed near system capacity.
+The current pessimistic-locking implementation now provides both a correctness and performance baseline.
 
-The next investigation therefore moves below the connection-pool layer.
+The next milestone is to implement optimistic concurrency and compare it against pessimistic locking under equivalent workloads.
 
-The goal is to determine where database time is actually being spent under high booking concurrency.
+The comparison will focus on:
 
-The investigation will focus on:
+- Correctness under concurrent booking attempts
+- Lock waiting vs conflict detection
+- Retry behavior
+- Latency
+- Throughput
+- Hot-seat contention
+- Parallel-seat workloads
+- Implementation complexity
 
-- PostgreSQL query execution
-- Transaction duration
-- Row-lock behavior
-- Database wait events
-- Concurrent `INSERT` / `UPDATE` behavior
-- Connection utilization
-- Query plans where relevant
-
-Conceptually, the investigation moves one layer deeper:
+Conceptually:
 
 ```text
-k6 Load
-   │
-   ▼
-Spring Boot
-   │
-   ▼
-HikariCP
-   │
-   ▼
-PostgreSQL
-   │
-   ├── Query execution
-   ├── Transactions
-   ├── Row locks
-   ├── Wait events
-   └── Concurrent writes
+               Pessimistic Locking
+                        │
+                        │
+                        ▼
+                SELECT FOR UPDATE
+                        │
+                        ▼
+                  Wait for lock
+
+
+               Optimistic Locking
+                        │
+                        ▼
+                 Read version
+                        │
+                        ▼
+                Attempt update
+                        │
+                        ▼
+              Detect conflict
 ```
 
-The objective is to identify the underlying database bottleneck before introducing further architectural changes.
+The goal is not simply to determine which strategy is faster.
 
-After establishing this baseline, optimistic concurrency will be implemented and compared against the current pessimistic-locking strategy.
+Instead, the experiment should identify how each concurrency-control strategy behaves under different contention patterns and what trade-offs each approach introduces.
 
 ---
 

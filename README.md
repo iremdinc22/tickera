@@ -55,7 +55,6 @@ UPDATE BOOKED                  UPDATE BOOKED
    │                              │
    ▼                              ▼
 CREATE BOOKING                 CREATE BOOKING
-
               💥 DOUBLE BOOKING
 ```
 
@@ -69,6 +68,7 @@ if (seat.getStatus() != SeatStatus.AVAILABLE) {
 }
 
 seat.setStatus(SeatStatus.BOOKED);
+
 bookingRepository.save(booking);
 ```
 
@@ -254,7 +254,6 @@ Results:
 booking_created.............: 1
 booking_conflict............: 49
 unexpected_responses........: 0
-
 Average response time.......: 80.36 ms
 p95 response time...........: 91.62 ms
 Throughput..................: ~441 req/s
@@ -338,55 +337,13 @@ The initial HikariCP pool size was:
 maximum connections = 10
 ```
 
-A high-throughput sustained workload produced approximately:
+Early high-throughput experiments showed measurable waiting during connection acquisition.
 
-```text
-~41,250 requests
-~4,119 requests/second
-p95 latency: 57.01 ms
-```
+This raised an important question:
 
-Connection metrics showed measurable waiting during connection acquisition.
+> Is the connection pool itself the bottleneck, or is pool saturation only a symptom of another bottleneck?
 
-This created a new hypothesis:
-
-> Would increasing the database connection pool improve throughput?
-
----
-
-# HikariCP Pool Size Experiment
-
-The pool size was increased from:
-
-```text
-10 → 20
-```
-
-while keeping the workload equivalent.
-
-Results:
-
-```text
-                         Pool 10        Pool 20
-------------------------------------------------
-Throughput               ~4119 req/s     ~3830 req/s
-Average latency          24.15 ms        25.97 ms
-p95 latency              57.01 ms        76.82 ms
-Avg connection acquire   ~21.6 ms        ~18.65 ms
-Timeouts                 0               0
-```
-
-Increasing the pool size reduced connection acquisition time slightly, but did not improve overall performance.
-
-Throughput decreased and p95 latency increased during this run.
-
-The conclusion is not that a pool size of 10 is universally optimal.
-
-Instead, the experiment demonstrates something more important:
-
-> Increasing the number of database connections does not automatically increase application throughput.
-
-Performance decisions need to be measured rather than assumed.
+To investigate this properly, controlled sustained-load and capacity tests were introduced.
 
 ---
 
@@ -400,7 +357,7 @@ spring:
     show-sql: false
 ```
 
-With the pool restored to 10, another high-throughput workload produced approximately:
+With the pool restored to 10, an earlier high-throughput workload produced approximately:
 
 ```text
 Throughput       : ~4198 req/s
@@ -492,24 +449,152 @@ Therefore:
 
 > The HikariCP connection pool was not a bottleneck under the tested 10 req/s sustained booking workload.
 
-This result does not contradict the earlier high-throughput HikariCP experiments.
+This established an important baseline: the connection pool behaves normally under low sustained load.
 
-The workloads answer different questions:
+---
+
+# Capacity Testing
+
+After establishing the low-load baseline, the workload was increased gradually to determine where the system begins to show saturation.
+
+The capacity experiment used a `constant-arrival-rate` workload and fresh seat ranges for each run.
+
+Representative results:
 
 ```text
-High-throughput benchmark
-        │
-        └── How does the system behave near much heavier load?
-
-Controlled sustained workload
-        │
-        └── What does normal runtime resource utilization look like
-            at a fixed 10 req/s?
+Requested Rate      Observed Behavior
+----------------------------------------------------
+10 req/s            Stable
+50 req/s            Stable
+75 req/s            Stable
+90 req/s            Stable
+95 req/s            Stable
+100 req/s           Stable on repeat run
+150 req/s           Stable
+200 req/s           Stable
+250 req/s           Stable
+400 req/s           Stable
+800 req/s           Minor dropped iterations
+1200 req/s          Increased latency and drops
+1500 req/s          Further latency growth
+2000 req/s          Clear saturation signals
 ```
 
-The experiments reinforce an important performance-engineering principle:
+The tests showed that the earlier failed 100 req/s run was not a reproducible system capacity boundary.
 
-> Bottlenecks are workload-dependent and should be identified through measurement rather than assumption.
+A repeated 100 req/s run completed successfully:
+
+```text
+Requests completed : 3000
+Request rate       : ~100 req/s
+Failures           : 0
+Average latency    : 3.92 ms
+p95 latency        : 8.37 ms
+```
+
+This reinforced another important performance-testing principle:
+
+> A single anomalous benchmark run should not automatically be treated as a system limit. Results should be reproducible.
+
+---
+
+# 2000 req/s Capacity Observation
+
+At 2000 requested iterations per second with the default HikariCP pool size of 10, the system produced:
+
+```text
+Requested rate       : 2000 req/s
+Achieved throughput  : ~1981 req/s
+Average latency      : 19.07 ms
+p95 latency          : 93.11 ms
+Maximum latency      : 757 ms
+Dropped iterations   : 559
+HTTP failures        : 0%
+```
+
+Although all executed HTTP requests succeeded, k6 could no longer maintain the requested arrival rate perfectly.
+
+At peak load, Grafana showed:
+
+```text
+HikariCP max connections     : 10
+HikariCP active connections  : 10
+HikariCP idle connections    : 0
+HikariCP pending connections : > 0
+```
+
+These metrics indicate that requests had begun waiting for database connections.
+
+However, pool saturation alone does not prove that the pool is undersized.
+
+This created the next hypothesis:
+
+> Would increasing the HikariCP connection pool reduce waiting and improve throughput?
+
+---
+
+# HikariCP Pool Size Experiment
+
+To test the hypothesis, the HikariCP maximum pool size was increased:
+
+```text
+10 → 20
+```
+
+The same 2000 req/s workload was repeated using a fresh set of seats.
+
+Results:
+
+```text
+                         Pool 10          Pool 20
+--------------------------------------------------
+Requested rate           2000 req/s       2000 req/s
+Achieved throughput      ~1981 req/s      ~1943 req/s
+Average latency          19.07 ms         47.00 ms
+p95 latency              93.11 ms         260.04 ms
+Maximum latency          757 ms           1.39 s
+Dropped iterations       559              1642
+HTTP failures            0%               0%
+```
+
+During the pool-20 run, Grafana showed:
+
+```text
+HikariCP active connections  : 20 / 20
+HikariCP idle connections    : 0 at peak
+HikariCP pending connections : significant spike
+```
+
+k6 also reported:
+
+```text
+Insufficient VUs, reached 500 active VUs and cannot initialize more
+```
+
+The test generator therefore reached its configured `maxVUs` limit while attempting to maintain the requested arrival rate.
+
+More importantly, increasing the database connection pool did not improve application performance.
+
+Instead:
+
+- Achieved throughput decreased
+- Average latency increased
+- p95 latency increased from `93.11 ms` to `260.04 ms`
+- Maximum latency increased to `1.39 s`
+- Dropped iterations increased from `559` to `1642`
+- Connection-pool waiting remained visible
+
+The simple hypothesis that the system only needed more database connections was therefore rejected.
+
+> Connection-pool saturation can be a symptom of a deeper bottleneck. Increasing pool capacity does not automatically increase throughput.
+
+The HikariCP pool size was restored to:
+
+```text
+maximum-pool-size: 10
+```
+
+This keeps the application on the original baseline configuration while the underlying bottleneck is investigated.
 
 ---
 
@@ -593,6 +678,7 @@ Redis, Kafka, distributed coordination, and other infrastructure will be introdu
 - Hot-seat contention testing
 - Parallel-seat testing
 - Sustained load testing
+- Capacity testing
 - Spring Boot Actuator metrics
 - Micrometer metrics
 - HikariCP connection-pool monitoring
@@ -684,13 +770,19 @@ Runtime Metrics
 HikariCP Investigation
           │
           ▼
-Runtime / Database Bottleneck Analysis
-          │
-          ▼
 Prometheus & Grafana Observability
           │
           ▼
-Optimistic Concurrency                 ← NEXT
+Capacity Testing
+          │
+          ▼
+HikariCP Saturation Investigation
+          │
+          ▼
+PostgreSQL Root-Cause Analysis              ← NEXT
+          │
+          ▼
+Optimistic Concurrency
           │
           ▼
 Compare Concurrency Strategies
@@ -724,56 +816,62 @@ The experiments performed so far demonstrate several important properties of the
 - PostgreSQL pessimistic locking prevents the reproduced double-booking race condition.
 - Expected booking conflicts must be distinguished from actual server failures.
 - Hot-seat contention affects latency and throughput, but row-lock contention is not the only performance factor.
-- Database connection acquisition can introduce measurable waiting under sufficiently heavy concurrency.
-- Increasing HikariCP from 10 to 20 connections did not improve the tested high-throughput workload.
-- Increasing connection-pool size does not automatically increase application throughput.
-- Under a controlled 10 req/s sustained workload, HikariCP remained largely underutilized with no pending connection requests.
-- The 10-connection pool was therefore not a bottleneck at that workload level.
+- Under low sustained load, the HikariCP connection pool remains largely underutilized.
+- Capacity testing must be repeated before treating a single anomalous result as a system limit.
+- As the booking workload approaches system capacity, HikariCP saturation becomes visible through active, idle, and pending connection metrics.
+- At 2000 requested req/s, the 10-connection pool reached full utilization and requests began waiting for database connections.
+- Increasing HikariCP from 10 to 20 connections did not resolve the observed bottleneck.
+- Under the same 2000 req/s workload, the larger pool increased latency and dropped iterations while reducing achieved throughput.
+- Connection-pool saturation therefore appears to be a symptom rather than sufficient evidence that the pool itself is undersized.
 - Prometheus and Grafana make it possible to correlate application traffic with HTTP latency, JVM utilization, and connection-pool behavior.
 - Performance bottlenecks depend on workload characteristics.
 - Performance changes should be validated with controlled experiments rather than assumptions.
+- Further investigation is required at the PostgreSQL query and transaction level.
 
 ---
 
-# Next Milestone — Optimistic Concurrency
+# Next Milestone — PostgreSQL Bottleneck Analysis
 
-The current pessimistic-locking implementation provides a correctness baseline.
+Capacity testing revealed that increasing the HikariCP connection pool does not resolve the performance degradation observed near system capacity.
 
-The next step is to implement optimistic concurrency and compare both strategies under equivalent workloads.
+The next investigation therefore moves below the connection-pool layer.
 
-The comparison will focus on:
+The goal is to determine where database time is actually being spent under high booking concurrency.
+
+The investigation will focus on:
+
+- PostgreSQL query execution
+- Transaction duration
+- Row-lock behavior
+- Database wait events
+- Concurrent `INSERT` / `UPDATE` behavior
+- Connection utilization
+- Query plans where relevant
+
+Conceptually, the investigation moves one layer deeper:
 
 ```text
-                    Pessimistic       Optimistic
-                    Locking           Concurrency
-                         │                 │
-                         ├──────┬──────────┤
-                                │
-                                ▼
-                         Correctness
-                                │
-                                ▼
-                            Latency
-                                │
-                                ▼
-                           Throughput
-                                │
-                                ▼
-                       Conflict Behavior
+k6 Load
+   │
+   ▼
+Spring Boot
+   │
+   ▼
+HikariCP
+   │
+   ▼
+PostgreSQL
+   │
+   ├── Query execution
+   ├── Transactions
+   ├── Row locks
+   ├── Wait events
+   └── Concurrent writes
 ```
 
-The goal is not simply to determine which strategy is "faster."
+The objective is to identify the underlying database bottleneck before introducing further architectural changes.
 
-Instead, the experiment should identify the trade-offs between:
-
-- Lock waiting
-- Conflict frequency
-- Retry behavior
-- Latency
-- Throughput
-- Implementation complexity
-
-under equivalent concurrency patterns.
+After establishing this baseline, optimistic concurrency will be implemented and compared against the current pessimistic-locking strategy.
 
 ---
 

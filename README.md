@@ -55,7 +55,6 @@ UPDATE BOOKED                  UPDATE BOOKED
    │                              │
    ▼                              ▼
 CREATE BOOKING                 CREATE BOOKING
-
               💥 DOUBLE BOOKING
 ```
 
@@ -136,7 +135,7 @@ Sequential correctness was not enough.
 
 # First Solution — Pessimistic Row Locking
 
-The first concurrency strategy implemented in Tickera is database-level pessimistic locking.
+The first concurrency strategy implemented in Tickera was database-level pessimistic locking.
 
 ```java
 @Lock(LockModeType.PESSIMISTIC_WRITE)
@@ -175,10 +174,10 @@ UPDATE BOOKED                       │
 CREATE BOOKING                      │
 COMMIT 🔓                            │
                                      ▼
-                                READ BOOKED
+                                 READ BOOKED
                                      │
                                      ▼
-                                409 Conflict
+                                 409 Conflict
 ```
 
 After introducing the lock, the same concurrent test produced:
@@ -814,6 +813,56 @@ The purpose of these experiments is not to claim a production throughput number,
 
 ---
 
+# Pessimistic vs Optimistic Locking
+
+After establishing pessimistic locking as the baseline, optimistic locking was implemented using a version column.
+
+The two strategies were then evaluated under equivalent 100-user workloads.
+
+Two contention patterns were tested:
+
+- **Hot seat:** 100 users compete for the same seat.
+- **Parallel seats:** 100 users concurrently book 100 different seats.
+
+Results:
+
+| Workload | Strategy | Result | Avg Latency | p95 Latency | Throughput |
+|---|---|---:|---:|---:|---:|
+| Hot seat | Pessimistic | 1 created / 99 conflicts | 224.24 ms | 245.34 ms | ~359.76 req/s |
+| Hot seat | Optimistic | 1 created / 99 conflicts | 317.55 ms | 324.06 ms | ~292.18 req/s |
+| Parallel seats | Pessimistic | 100 created / 0 conflicts | 135.07 ms | 180.91 ms | ~467.76 req/s |
+| Parallel seats | Optimistic | 100 created / 0 conflicts | 135.43 ms | 155.89 ms | ~531.19 req/s |
+
+Both strategies preserved the core invariant:
+
+> A seat was never successfully booked more than once.
+
+Under extreme hot-seat contention, pessimistic locking performed better in the observed local run.
+
+With independent parallel-seat bookings, average latency was almost identical, while optimistic locking showed better p95 latency and throughput in the observed run.
+
+The experiment therefore does not establish one strategy as universally superior.
+
+Instead, it demonstrates that concurrency-control decisions should be evaluated against the expected contention pattern:
+
+```text
+High contention
+      │
+      ▼
+Pessimistic locking may avoid
+wasted conflicting work
+
+Low contention
+      │
+      ▼
+Optimistic locking can avoid
+unnecessary lock coordination
+```
+
+These measurements are experimental observations from a local environment and should not be interpreted as universal performance characteristics.
+
+---
+
 # Current Architecture
 
 ```text
@@ -853,8 +902,8 @@ The purpose of these experiments is not to claim a production throughput number,
                              ▼
                     ┌─────────────────┐
                     │   PostgreSQL    │
-                    │ SELECT ...      │
-                    │ FOR UPDATE      │
+                    │ Concurrency     │
+                    │    Control      │
                     └─────────────────┘
 ```
 
@@ -889,6 +938,8 @@ Redis, Kafka, distributed coordination, and other infrastructure will be introdu
 - PostgreSQL persistence
 - Transactional booking operations
 - Pessimistic row locking
+- Optimistic locking with version-based conflict detection
+- Pessimistic vs optimistic concurrency benchmarking
 - Protection against concurrent double booking
 - Swagger / OpenAPI documentation
 - Dockerized PostgreSQL
@@ -1012,28 +1063,40 @@ Tomcat Thread-Pool Investigation
 Load-Generator Limit Investigation
           │
           ▼
-Optimistic Concurrency                 ← NEXT
+Optimistic Concurrency
           │
           ▼
 Compare Concurrency Strategies
           │
           ▼
-Redis / Distributed Coordination
+Integration & Concurrency Testing       ← NEXT
           │
           ▼
 Idempotency
           │
           ▼
+Redis / Distributed Coordination
+          │
+          ▼
+Multi-Instance Deployment
+          │
+          ▼
 Kafka & Event-Driven Processing
           │
           ▼
-Failure Handling
+Reliable Event Publishing
           │
           ▼
-Integration & Concurrency Testing
+Failure Handling & Retry
           │
           ▼
-Performance & Scalability Testing
+Extended Observability
+          │
+          ▼
+CI/CD & Testcontainers
+          │
+          ▼
+Final Performance Comparison
 ```
 
 ---
@@ -1043,82 +1106,61 @@ Performance & Scalability Testing
 The experiments performed so far demonstrate several important properties of the system:
 
 - Sequential correctness does not guarantee concurrent correctness.
-
 - PostgreSQL pessimistic locking prevents the reproduced double-booking race condition.
-
+- Version-based optimistic locking also preserves the single-booking invariant under concurrent access.
+- Both pessimistic and optimistic strategies prevented double booking in the tested hot-seat workload.
 - Expected booking conflicts must be distinguished from actual server failures.
-
+- Under extreme hot-seat contention, pessimistic locking performed better in the observed local comparison.
+- Under parallel independent-seat workload, optimistic locking showed better p95 latency and throughput in the observed run.
+- No concurrency-control strategy should be considered universally superior based on a single workload.
+- The expected contention pattern is an important factor when choosing a concurrency-control strategy.
 - Hot-seat contention affects latency and throughput, but row-lock contention is not the only performance factor.
-
 - Under low sustained load, the HikariCP connection pool remains largely underutilized.
-
 - As the workload approaches local system capacity, connection waiting, latency, and dropped iterations become visible.
-
 - Increasing HikariCP from 10 to 20 connections did not improve throughput and increased latency in the tested workload.
-
 - `pg_stat_statements` showed that individual booking SQL statements execute very quickly, so raw query execution time alone does not explain end-to-end latency.
-
 - Disabling synchronous commit reduced WAL synchronization cost but did not materially improve application-level performance.
-
 - Increasing Tomcat's worker-thread limit from 200 to 400 removed the observed thread-pool saturation without materially increasing throughput.
-
 - Increasing k6 `maxVUs` from 500 to 1000 did not increase achieved throughput. Instead, latency and dropped iterations increased significantly.
-
 - The observed local capacity boundary is therefore not explained by a single connection-pool, Tomcat-thread, WAL, or k6 VU configuration limit.
-
 - Additional concurrency can reduce performance once the system enters saturation.
-
 - Performance bottlenecks emerge from interactions between multiple layers and should be investigated through controlled experiments rather than assumptions.
-
 - Local benchmark results should not be interpreted as production capacity because the load generator, application, database, observability stack, and Docker runtime share the same machine.
 
 ---
 
-# Next Milestone — Optimistic Concurrency
+# Next Milestone — Automated Concurrency Testing
 
-The current pessimistic-locking implementation now provides both a correctness and performance baseline.
+The next milestone is to convert the manually verified concurrency invariant into repeatable integration tests using JUnit and Testcontainers.
 
-The next milestone is to implement optimistic concurrency and compare it against pessimistic locking under equivalent workloads.
-
-The comparison will focus on:
-
-- Correctness under concurrent booking attempts
-- Lock waiting vs conflict detection
-- Retry behavior
-- Latency
-- Throughput
-- Hot-seat contention
-- Parallel-seat workloads
-- Implementation complexity
+The tests will verify that concurrent booking attempts cannot create more than one successful booking for the same seat.
 
 Conceptually:
 
 ```text
-               Pessimistic Locking
-                        │
-                        │
-                        ▼
-                SELECT FOR UPDATE
-                        │
-                        ▼
-                  Wait for lock
-
-
-               Optimistic Locking
-                        │
-                        ▼
-                 Read version
-                        │
-                        ▼
-                Attempt update
-                        │
-                        ▼
-              Detect conflict
+JUnit
+  │
+  ▼
+Start PostgreSQL with Testcontainers
+  │
+  ▼
+Create fresh seat
+  │
+  ▼
+Launch concurrent booking attempts
+  │
+  ▼
+Wait for all requests
+  │
+  ▼
+Verify invariant
+  │
+  ├── Exactly one successful booking
+  │
+  └── No duplicate booking
 ```
 
-The goal is not simply to determine which strategy is faster.
-
-Instead, the experiment should identify how each concurrency-control strategy behaves under different contention patterns and what trade-offs each approach introduces.
+This will provide a regression safety net before introducing distributed coordination, idempotency, multi-instance deployment, and event-driven processing.
 
 ---
 

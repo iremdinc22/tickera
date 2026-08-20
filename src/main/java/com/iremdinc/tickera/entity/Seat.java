@@ -36,4 +36,8 @@ public class Seat {
     @Column(nullable = false)
     @Builder.Default
     private SeatStatus status = SeatStatus.AVAILABLE;
+
+    @Version
+    @Column(nullable = false)
+    private Long version;
 }

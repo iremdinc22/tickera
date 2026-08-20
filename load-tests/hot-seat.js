@@ -1,7 +1,6 @@
 import http from 'k6/http';
 import { check } from 'k6';
 import { Counter, Rate } from 'k6/metrics';
-import exec from 'k6/execution';
 
 const bookingCreated = new Counter('booking_created');
 const bookingConflict = new Counter('booking_conflict');
@@ -9,11 +8,11 @@ const unexpectedResponses = new Counter('unexpected_responses');
 
 const validBookingResponse = new Rate('valid_booking_response');
 
-const FIRST_SEAT_ID = Number(__ENV.FIRST_SEAT_ID);
+const SEAT_ID = Number(__ENV.SEAT_ID);
 
 export const options = {
   scenarios: {
-    parallel_load: {
+    hot_seat: {
       executor: 'per-vu-iterations',
       vus: 100,
       iterations: 1,
@@ -23,46 +22,35 @@ export const options = {
 
   thresholds: {
     valid_booking_response: ['rate==1'],
-    http_req_duration: ['p(95)<1000'],
     unexpected_responses: ['count==0'],
   },
 };
 
 export default function () {
-  const iteration = exec.scenario.iterationInTest;
-
-  // Her iteration farklı seat kullanır.
-  const seatId = FIRST_SEAT_ID + iteration;
-
   const payload = JSON.stringify({
-    seatId,
-    userId: `parallel-user-${iteration}`,
+    seatId: SEAT_ID,
+    userId: `hot-seat-user-${__VU}`,
   });
-
-  const params = {
-    headers: {
-      'Content-Type': 'application/json',
-    },
-
-    tags: {
-      endpoint: 'parallel-booking',
-    },
-  };
 
   const response = http.post(
     'http://localhost:8080/bookings',
     payload,
-    params
+    {
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      tags: {
+        endpoint: 'hot-seat',
+      },
+    }
   );
 
   if (response.status === 201) {
     bookingCreated.add(1);
     validBookingResponse.add(true);
-
   } else if (response.status === 409) {
     bookingConflict.add(1);
     validBookingResponse.add(true);
-
   } else {
     unexpectedResponses.add(1);
     validBookingResponse.add(false);

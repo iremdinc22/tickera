@@ -41,6 +41,7 @@ public class BookingService {
     private final IdempotencyRecordRepository idempotencyRecordRepository;
     private final MeterRegistry meterRegistry;
     private final PlatformTransactionManager transactionManager;
+    private final SeatHoldService seatHoldService;
 
     @Transactional
     public BookingResponse createBooking(
@@ -69,7 +70,9 @@ public class BookingService {
         Seat seat = seatRepository
                 .findByIdForUpdate(request.seatId())
                 .orElseThrow(() ->
-                        new RuntimeException("Seat not found")
+                        new RuntimeException(
+                                "Seat not found"
+                        )
                 );
 
         lockSample.stop(
@@ -125,7 +128,9 @@ public class BookingService {
         Seat seat = seatRepository
                 .findById(request.seatId())
                 .orElseThrow(() ->
-                        new RuntimeException("Seat not found")
+                        new RuntimeException(
+                                "Seat not found"
+                        )
                 );
 
         if (seat.getStatus() != SeatStatus.AVAILABLE) {
@@ -149,6 +154,83 @@ public class BookingService {
         return toBookingResponse(savedBooking);
     }
 
+    /**
+     * Redis hold mekanizmasını kullanan booking flow.
+     *
+     * Kullanıcı önce seat'i Redis'te hold etmiş olmalı.
+     * Daha sonra gerçek booking PostgreSQL transaction'ı
+     * ve pessimistic lock altında gerçekleştirilir.
+     */
+    @Transactional
+    public BookingResponse createHeldBooking(
+            CreateBookingRequest request
+    ) {
+
+        /*
+         * Seat bu kullanıcı tarafından hold edilmemişse
+         * booking işlemine izin vermiyoruz.
+         */
+        if (!seatHoldService.isHeldByUser(
+                request.seatId(),
+                request.userId()
+        )) {
+
+            throw new SeatNotAvailableException(
+                    "Seat is not held by this user"
+            );
+        }
+
+        /*
+         * Redis hold geçici reservation'ı yönetir.
+         *
+         * Gerçek database correctness garantisi için
+         * PostgreSQL pessimistic lock kullanmaya devam ediyoruz.
+         */
+        Seat seat = seatRepository
+                .findByIdForUpdate(request.seatId())
+                .orElseThrow(() ->
+                        new RuntimeException(
+                                "Seat not found"
+                        )
+                );
+
+        if (seat.getStatus() != SeatStatus.AVAILABLE) {
+
+            throw new SeatNotAvailableException(
+                    "Seat is not available"
+            );
+        }
+
+        seat.setStatus(
+                SeatStatus.BOOKED
+        );
+
+        Booking booking =
+                Booking.builder()
+                        .seat(seat)
+                        .userId(request.userId())
+                        .build();
+
+        Booking savedBooking =
+                bookingRepository
+                        .saveAndFlush(booking);
+
+        /*
+         * Booking başarıyla oluşturulduktan sonra
+         * geçici Redis hold'una artık ihtiyaç yok.
+         *
+         * releaseSeat owner-aware ve atomic çalışır.
+         */
+        seatHoldService.releaseSeat(
+                request.seatId(),
+                request.userId()
+        );
+
+        return toBookingResponse(
+                savedBooking
+        );
+    }
+
     public BookingResponse createBookingIdempotent(
             String idempotencyKey,
             CreateBookingRequest request
@@ -167,8 +249,8 @@ public class BookingService {
                     );
 
             /*
-             * Key zaten varsa önce request'in aynı
-             * logical operation olup olmadığını kontrol ediyoruz.
+             * Key daha önce kullanılmışsa request hash'i
+             * aynı mı kontrol ediyoruz.
              */
             if (snapshot != null) {
 
@@ -178,8 +260,8 @@ public class BookingService {
                 );
 
                 /*
-                 * İşlem tamamlanmışsa retry yapan client'a
-                 * daha önce oluşturulan booking'i döndürüyoruz.
+                 * Daha önce tamamlanmışsa aynı booking
+                 * sonucunu retry yapan client'a döndürüyoruz.
                  */
                 if (snapshot.status()
                         == IdempotencyStatus.COMPLETED) {
@@ -190,21 +272,16 @@ public class BookingService {
                 }
 
                 /*
-                 * PROCESSING ise başka bir request şu anda
+                 * PROCESSING durumundaysa başka bir request
                  * bu logical operation'ın owner'ıdır.
-                 *
-                 * Yeni booking oluşturmuyoruz.
-                 * İşlemin tamamlanmasını bekliyoruz.
                  */
                 waitBeforeRetry();
                 continue;
             }
 
             /*
-             * Henüz record yok.
-             *
-             * Bu request idempotency key'in owner'ı
-             * olmaya çalışıyor.
+             * Henüz record yoksa bu request key'in
+             * owner'ı olmaya çalışır.
              */
             boolean claimed =
                     tryClaimIdempotencyKey(
@@ -212,32 +289,22 @@ public class BookingService {
                             requestHash
                     );
 
-            /*
-             * Başka thread bizden önce key'i claim etmiş
-             * olabilir. O durumda tekrar state kontrolüne
-             * dönüyoruz.
-             */
             if (!claimed) {
                 continue;
             }
 
-            /*
-             * Bu request artık owner.
-             *
-             * Booking'i gerçekleştirip aynı transaction
-             * içerisinde idempotency kaydını COMPLETED
-             * durumuna geçiriyoruz.
-             */
             try {
+
                 return processOwnedBooking(
                         idempotencyKey,
                         request
                 );
+
             } catch (RuntimeException exception) {
 
                 /*
-                 * Booking başarısız olursa PROCESSING
-                 * kaydını sonsuza kadar bırakmıyoruz.
+                 * Owner işlemi başarısız olursa PROCESSING
+                 * kaydını temizliyoruz.
                  */
                 releaseIdempotencyClaim(
                         idempotencyKey
@@ -252,13 +319,6 @@ public class BookingService {
         );
     }
 
-    /*
-     * Idempotency key üzerinde ownership almaya çalışır.
-     *
-     * Bu işlem ayrı transaction'da çalışır.
-     * Böylece PROCESSING kaydı hemen commit edilir ve
-     * diğer concurrent request'ler tarafından görülebilir.
-     */
     private boolean tryClaimIdempotencyKey(
             String idempotencyKey,
             String requestHash
@@ -297,20 +357,12 @@ public class BookingService {
 
             /*
              * UNIQUE(idempotency_key) constraint:
-             *
-             * başka bir thread bu key'i bizden önce
-             * claim etmiş demektir.
+             * başka bir request key'i bizden önce claim etti.
              */
             return false;
         }
     }
 
-    /*
-     * Owner request booking işlemini gerçekleştirir.
-     *
-     * Booking oluşturma ve PROCESSING -> COMPLETED
-     * geçişi aynı transaction içinde yapılır.
-     */
     private BookingResponse processOwnedBooking(
             String idempotencyKey,
             CreateBookingRequest request
@@ -381,12 +433,6 @@ public class BookingService {
         });
     }
 
-    /*
-     * Idempotency kaydını kısa ve bağımsız bir
-     * transaction içerisinde okuyoruz.
-     *
-     * Böylece her retry en güncel committed state'i görür.
-     */
     private IdempotencySnapshot findIdempotencySnapshot(
             String idempotencyKey
     ) {
@@ -415,6 +461,7 @@ public class BookingService {
     ) {
 
         if (bookingId == null) {
+
             throw new IllegalStateException(
                     "Completed idempotency record has no booking"
             );
@@ -440,13 +487,6 @@ public class BookingService {
         });
     }
 
-    /*
-     * Owner işlemi başarısız olursa PROCESSING kaydını
-     * temizliyoruz.
-     *
-     * Böylece daha sonraki retry tekrar ownership
-     * alabilir.
-     */
     private void releaseIdempotencyClaim(
             String idempotencyKey
     ) {

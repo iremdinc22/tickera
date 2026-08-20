@@ -15,6 +15,13 @@ spring:
       ddl-auto: update
     show-sql: false
 
+  data:
+    redis:
+      host: localhost
+      port: 6380
+      connect-timeout: 2s
+      timeout: 2s
+
 server:
   tomcat:
     mbeanregistry:
@@ -30,3 +37,7 @@ management:
     distribution:
       percentiles-histogram:
         http.server.requests: true
+
+tickera:
+  seat-hold:
+    duration: 2m

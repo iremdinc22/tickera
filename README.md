@@ -6,7 +6,7 @@ The project started with a simple question:
 
 > What happens when many users try to book the same seat at the same time?
 
-It then evolved into experiments around concurrency control, idempotency, load testing, database behavior, observability, and system bottlenecks.
+It then evolved into experiments around concurrency control, idempotency, temporary seat reservations, distributed coordination, load testing, database behavior, observability, and system bottlenecks.
 
 ---
 
@@ -114,7 +114,7 @@ The contention pattern matters.
 
 Concurrency correctness is protected with JUnit and Testcontainers.
 
-Tests run against a real PostgreSQL 17 instance.
+Tests run against PostgreSQL 17.
 
 ```text
 JUnit
@@ -135,11 +135,11 @@ Verify invariants
 The tests verify that:
 
 - Exactly one booking is created for a contested seat.
-- The seat ends in `BOOKED` state.
+- The seat ends in `BOOKED`.
 - Pessimistic locking preserves the invariant.
 - Optimistic locking preserves the invariant.
 
-This allows concurrency regressions to be detected automatically with:
+Concurrency regressions can be detected automatically with:
 
 ```bash
 ./mvnw test
@@ -149,7 +149,7 @@ This allows concurrency regressions to be detected automatically with:
 
 ## Idempotent Booking
 
-Concurrency control prevents different transactions from successfully claiming the same seat.
+Concurrency control prevents competing transactions from successfully claiming the same seat.
 
 It does not solve repeated delivery of the same logical request.
 
@@ -206,9 +206,9 @@ same key + different request
 
 Sequential idempotency alone is not enough.
 
-Multiple identical retries can arrive at the same time and all initially observe that the idempotency key does not exist.
+Multiple identical retries can arrive at the same time and initially observe that the idempotency key does not exist.
 
-Tickera therefore uses explicit idempotency states:
+Tickera therefore uses explicit states:
 
 ```text
 PROCESSING
@@ -258,9 +258,91 @@ and verifies:
 same booking ID returned
 ```
 
-This demonstrates an important distinction:
-
 > Seat locking protects a resource. Idempotency protects a logical operation.
+
+---
+
+## Redis Seat Holds
+
+Tickera uses Redis for short-lived seat reservations before the final booking is committed to PostgreSQL.
+
+```text
+AVAILABLE
+    │
+    ▼
+Redis HOLD
+SET NX + TTL
+    │
+    ▼
+Hold ownership validation
+    │
+    ▼
+PostgreSQL booking
+    │
+    ▼
+BOOKED
+    │
+    ▼
+Redis hold released
+```
+
+Seat holds provide:
+
+- Atomic acquisition using Redis `SET NX`
+- Configurable expiration using TTL
+- Owner-aware atomic release
+- Protection against booking a hold owned by another user
+- Automatic hold release after successful booking
+- Validation against non-existing and already booked seats
+- Shared coordination across multiple application instances
+
+Redis is used for temporary reservation state.
+
+PostgreSQL remains the source of truth for permanent booking state and final transaction correctness.
+
+---
+
+## Multi-Instance Coordination
+
+Two independent Tickera instances were run against the same Redis and PostgreSQL infrastructure:
+
+```text
+                 Redis
+                :6380
+               /     \
+              /       \
+     Tickera A         Tickera B
+       :8081             :8082
+              \         /
+               \       /
+              PostgreSQL
+                :5436
+```
+
+Concurrent hold requests were sent through different instances for the same seat.
+
+Observed behavior:
+
+```text
+Instance A / user A
+        │
+        ├──── same seat ────┐
+        │                   │
+Instance B / user B         │
+                            ▼
+                           Redis
+                            │
+                            ▼
+                       one winner
+```
+
+One request received `200 OK`.
+
+The competing request received `409 Conflict`.
+
+The winning hold was then successfully used to create the booking through the other Spring Boot instance.
+
+This verified that hold state is shared distributed state rather than instance-local JVM state.
 
 ---
 
@@ -282,7 +364,7 @@ Workloads include:
 - Parallel-seat booking
 - Sustained load
 - Capacity testing
-- Constant arrival rate experiments
+- Constant arrival-rate experiments
 
 A 100-user hot-seat test produced:
 
@@ -378,8 +460,6 @@ Maximum VUs were increased:
 
 Additional concurrency increased latency instead of throughput.
 
-The overall conclusion was:
-
 > Near saturation, adding more concurrency can increase waiting without increasing useful throughput.
 
 ---
@@ -420,31 +500,26 @@ The dashboard tracks:
 
 ## Test Infrastructure
 
-Integration tests share a PostgreSQL 17 Testcontainer through a common base test configuration.
+Integration testing uses real PostgreSQL and Redis containers.
+
+The PostgreSQL integration-test infrastructure is shared through a common base configuration.
+
+Redis-specific tests run against Redis Testcontainers.
+
+Current correctness coverage includes:
 
 ```text
-             PostgreSQL 17
-              Testcontainer
-                   │
-          ┌────────┴────────┐
-          ▼                 ▼
-Booking Concurrency   Idempotency
-      Tests              Tests
-```
+PostgreSQL
+├── Pessimistic concurrency
+├── Optimistic concurrency
+└── Idempotency
 
-This reduced unnecessary container startup and shutdown overhead.
-
-Representative full-suite result:
-
-```text
-Tests run: 4
-Failures: 0
-Errors: 0
-Skipped: 0
-
-BUILD SUCCESS
-
-Total time: 9.370 s
+Redis
+├── Concurrent seat holds
+├── TTL expiration
+├── Invalid seat validation
+├── Hold ownership
+└── Hold → Booking → Release
 ```
 
 ---
@@ -455,6 +530,7 @@ Detailed technical notes and experiment results are available in the `docs/` dir
 
 - [Concurrency Control](docs/concurrency.md) — race conditions, pessimistic vs optimistic locking, and concurrency integration testing
 - [Idempotency](docs/idempotency.md) — idempotency keys, request fingerprinting, concurrent retries, and request ownership
+- [Redis Seat Holds](docs/redis-seat-holds.md) — temporary reservations, TTL, ownership, atomic release, and multi-instance coordination
 - [Performance Testing](docs/performance-testing.md) — k6 workloads, capacity experiments, and bottleneck analysis
 - [Observability](docs/observability.md) — Prometheus, Grafana, HikariCP, Tomcat, JVM, and application-level metrics
 
@@ -463,28 +539,25 @@ Detailed technical notes and experiment results are available in the `docs/` dir
 ## Current Architecture
 
 ```text
-                  Client / k6
-                       │
-                       ▼
-                 Spring Boot API
-                       │
-                       ▼
-                BookingController
-                       │
-                       ▼
-                 BookingService
-                       │
-          ┌────────────┼────────────┐
-          ▼            ▼            ▼
-     SeatRepository BookingRepo IdempotencyRepo
-          │            │            │
-          └────────────┼────────────┘
-                       ▼
-                   PostgreSQL
-                       │
-          ┌────────────┼────────────┐
-          ▼            ▼            ▼
-    Row Locking    @Version     Idempotency
+                         Client / k6
+                              │
+                              ▼
+                       Spring Boot API
+                              │
+                 ┌────────────┴────────────┐
+                 ▼                         ▼
+        SeatHoldController         BookingController
+                 │                         │
+                 ▼                         ▼
+         SeatHoldService             BookingService
+                 │                         │
+                 ▼                 ┌───────┴────────┐
+               Redis               ▼                ▼
+          SET NX + TTL           Redis          PostgreSQL
+                                  │                 │
+                           Hold ownership          ├── Row locking
+                                                   ├── @Version
+                                                   └── Idempotency
 ```
 
 ---
@@ -496,12 +569,14 @@ Detailed technical notes and experiment results are available in the `docs/` dir
 - Java 21
 - Spring Boot
 - Spring Data JPA
+- Spring Data Redis
 - Hibernate
 - Maven
 
-### Database
+### Data & Coordination
 
 - PostgreSQL 17
+- Redis 7.4
 - HikariCP
 - `pg_stat_statements`
 
@@ -509,6 +584,8 @@ Detailed technical notes and experiment results are available in the `docs/` dir
 
 - JUnit 5
 - Testcontainers
+- PostgreSQL Testcontainers
+- Redis Testcontainers
 - k6
 
 ### Observability
@@ -538,11 +615,18 @@ Detailed technical notes and experiment results are available in the `docs/` dir
 - Idempotent booking requests
 - SHA-256 request fingerprinting
 - Idempotency key conflict detection
-- `PROCESSING` / `COMPLETED` request states
-- Concurrent retry coordination
+- `PROCESSING` / `COMPLETED` idempotency states
+- Concurrent idempotency coordination
+- Redis-based temporary seat holds
+- Atomic hold acquisition using `SET NX`
+- Configurable hold TTL
+- Owner-aware atomic hold release
+- Hold ownership enforcement during booking
+- Hold-to-booking lifecycle
+- Multi-instance Redis coordination
+- Redis integration tests with Testcontainers
 - JUnit concurrency integration tests
-- Testcontainers PostgreSQL tests
-- Shared integration-test PostgreSQL container
+- PostgreSQL Testcontainers tests
 - k6 load and capacity testing
 - Prometheus / Grafana observability
 - HikariCP monitoring
@@ -587,19 +671,28 @@ Idempotency
 Concurrent Idempotency
         │
         ▼
-Redis / Distributed Coordination      ← NEXT
+Redis Seat Holds                       ✓
         │
         ▼
-Multi-Instance Deployment
+TTL & Hold Ownership                   ✓
         │
         ▼
-Kafka / Event-Driven Processing
+Multi-Instance Coordination            ✓
+        │
+        ▼
+Kafka / Event-Driven Processing        ← NEXT
         │
         ▼
 Reliable Event Publishing
         │
         ▼
+Transactional Outbox
+        │
+        ▼
 Failure Handling & Retry
+        │
+        ▼
+Idempotent Consumers
         │
         ▼
 GitHub Actions / CI
@@ -618,39 +711,47 @@ GitHub Actions / CI
 - SQL execution time alone does not explain end-to-end system latency.
 - Idempotency and locking solve different problems.
 - Application-level `check → insert` logic is insufficient for concurrency-safe idempotency.
-- Database constraints can be used as part of coordination and ownership mechanisms.
+- Database constraints can participate in coordination and ownership mechanisms.
+- Redis is well suited to short-lived reservation state with TTL.
+- Redis seat holds do not replace PostgreSQL transaction correctness.
+- Shared Redis state can coordinate multiple independent application instances.
+- Redis state should be validated against the PostgreSQL source of truth.
 - Correctness invariants should be protected by repeatable automated tests.
 
 ---
 
-## Next — Redis & Distributed Coordination
+## Next — Kafka & Event-Driven Processing
 
-The current implementation relies on PostgreSQL as the central coordination point.
-
-The next phase will investigate how the design behaves when multiple application instances are introduced.
+The next phase introduces asynchronous event processing after successful bookings.
 
 ```text
-               Load Balancer
-                    │
-           ┌────────┴────────┐
-           ▼                 ▼
-      Instance A         Instance B
-           │                 │
-           └────────┬────────┘
-                    ▼
-                PostgreSQL
+Booking committed
+       │
+       ▼
+BookingCreated
+       │
+       ▼
+     Kafka
+       │
+       ▼
+    Consumer
 ```
 
-Redis will only be introduced if it solves a concrete problem better than the current database-backed approach.
+The first implementation will introduce basic producer and consumer behavior.
 
-The goal is to evaluate:
+The following phase will investigate the failure window between PostgreSQL commits and Kafka publishing.
 
-- Distributed coordination
-- Multi-instance correctness
-- Lock ownership
-- Short-lived reservation state
-- Performance trade-offs
-- Failure behavior
+That leads into reliable event delivery patterns such as the Transactional Outbox Pattern.
+
+The goal is to explore:
+
+- Event-driven communication
+- Kafka producers and consumers
+- Delivery guarantees
+- Duplicate event handling
+- Failure and retry behavior
+- Reliable database-to-Kafka event publishing
+- Idempotent event consumption
 
 ---
 

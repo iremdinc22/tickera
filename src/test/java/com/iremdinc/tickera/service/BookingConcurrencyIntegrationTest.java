@@ -8,6 +8,7 @@ import com.iremdinc.tickera.exception.SeatNotAvailableException;
 import com.iremdinc.tickera.repository.BookingRepository;
 import com.iremdinc.tickera.repository.EventRepository;
 import com.iremdinc.tickera.repository.SeatRepository;
+import com.iremdinc.tickera.support.PostgresIntegrationTest;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -15,12 +16,6 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.orm.ObjectOptimisticLockingFailureException;
-import org.springframework.test.context.DynamicPropertyRegistry;
-import org.springframework.test.context.DynamicPropertySource;
-
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
-import org.testcontainers.postgresql.PostgreSQLContainer;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -30,46 +25,16 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.fail;
 
 @SpringBootTest
-@Testcontainers
-class BookingConcurrencyIntegrationTest {
+class BookingConcurrencyIntegrationTest
+        extends PostgresIntegrationTest {
 
     private static final int THREAD_COUNT = 20;
-
-    @Container
-    static final PostgreSQLContainer postgres =
-            new PostgreSQLContainer("postgres:17")
-                    .withDatabaseName("tickera_test")
-                    .withUsername("test")
-                    .withPassword("test");
-
-    @DynamicPropertySource
-    static void configureProperties(DynamicPropertyRegistry registry) {
-
-        registry.add(
-                "spring.datasource.url",
-                postgres::getJdbcUrl
-        );
-
-        registry.add(
-                "spring.datasource.username",
-                postgres::getUsername
-        );
-
-        registry.add(
-                "spring.datasource.password",
-                postgres::getPassword
-        );
-
-        registry.add(
-                "spring.jpa.hibernate.ddl-auto",
-                () -> "create-drop"
-        );
-    }
 
     @Autowired
     private BookingService bookingService;
@@ -118,101 +83,106 @@ class BookingConcurrencyIntegrationTest {
         ExecutorService executor =
                 Executors.newFixedThreadPool(THREAD_COUNT);
 
-        CountDownLatch readyLatch =
-                new CountDownLatch(THREAD_COUNT);
+        try {
 
-        CountDownLatch startLatch =
-                new CountDownLatch(1);
+            CountDownLatch readyLatch =
+                    new CountDownLatch(THREAD_COUNT);
 
-        List<Future<Boolean>> futures =
-                new ArrayList<>();
+            CountDownLatch startLatch =
+                    new CountDownLatch(1);
 
-        for (int i = 0; i < THREAD_COUNT; i++) {
+            List<Future<Boolean>> futures =
+                    new ArrayList<>();
 
-            String userId = "user-" + i;
+            for (int i = 0; i < THREAD_COUNT; i++) {
 
-            futures.add(
-                    executor.submit(() -> {
+                String userId = "user-" + i;
 
-                        readyLatch.countDown();
+                futures.add(
+                        executor.submit(() -> {
 
-                        startLatch.await();
+                            readyLatch.countDown();
 
-                        try {
+                            startLatch.await();
 
-                            bookingService.createBooking(
-                                    new CreateBookingRequest(
-                                            seatId,
-                                            userId
-                                    )
-                            );
+                            try {
 
-                            return true;
+                                bookingService.createBooking(
+                                        new CreateBookingRequest(
+                                                seatId,
+                                                userId
+                                        )
+                                );
 
-                        } catch (SeatNotAvailableException exception) {
+                                return true;
 
-                            return false;
-                        }
-                    })
-            );
-        }
+                            } catch (SeatNotAvailableException exception) {
 
-        readyLatch.await();
-
-        startLatch.countDown();
-
-        int successCount = 0;
-        int failureCount = 0;
-
-        for (Future<Boolean> future : futures) {
-
-            try {
-
-                boolean successful = future.get();
-
-                if (successful) {
-                    successCount++;
-                } else {
-                    failureCount++;
-                }
-
-            } catch (ExecutionException exception) {
-
-                fail(
-                        "Unexpected exception: "
-                                + exception.getCause()
+                                return false;
+                            }
+                        })
                 );
             }
+
+            readyLatch.await();
+            startLatch.countDown();
+
+            int successCount = 0;
+            int failureCount = 0;
+
+            for (Future<Boolean> future : futures) {
+
+                try {
+
+                    boolean successful =
+                            future.get();
+
+                    if (successful) {
+                        successCount++;
+                    } else {
+                        failureCount++;
+                    }
+
+                } catch (ExecutionException exception) {
+
+                    fail(
+                            "Unexpected exception: "
+                                    + exception.getCause()
+                    );
+                }
+            }
+
+            assertEquals(
+                    1,
+                    successCount,
+                    "Exactly one pessimistic booking should succeed"
+            );
+
+            assertEquals(
+                    THREAD_COUNT - 1,
+                    failureCount,
+                    "All other pessimistic booking attempts should fail"
+            );
+
+            assertEquals(
+                    1,
+                    bookingRepository.count(),
+                    "Database must contain exactly one booking"
+            );
+
+            Seat seat = seatRepository.findById(seatId)
+                    .orElseThrow();
+
+            assertEquals(
+                    SeatStatus.BOOKED,
+                    seat.getStatus(),
+                    "Seat must be BOOKED"
+            );
+
+        } finally {
+
+            shutdownExecutor(executor);
         }
-
-        executor.shutdown();
-
-        assertEquals(
-                1,
-                successCount,
-                "Exactly one pessimistic booking should succeed"
-        );
-
-        assertEquals(
-                THREAD_COUNT - 1,
-                failureCount,
-                "All other pessimistic booking attempts should fail"
-        );
-
-        assertEquals(
-                1,
-                bookingRepository.count(),
-                "Database must contain exactly one booking"
-        );
-
-        Seat seat = seatRepository.findById(seatId)
-                .orElseThrow();
-
-        assertEquals(
-                SeatStatus.BOOKED,
-                seat.getStatus(),
-                "Seat must be BOOKED"
-        );
     }
 
     @Test
@@ -222,101 +192,134 @@ class BookingConcurrencyIntegrationTest {
         ExecutorService executor =
                 Executors.newFixedThreadPool(THREAD_COUNT);
 
-        CountDownLatch readyLatch =
-                new CountDownLatch(THREAD_COUNT);
+        try {
 
-        CountDownLatch startLatch =
-                new CountDownLatch(1);
+            CountDownLatch readyLatch =
+                    new CountDownLatch(THREAD_COUNT);
 
-        List<Future<Boolean>> futures =
-                new ArrayList<>();
+            CountDownLatch startLatch =
+                    new CountDownLatch(1);
 
-        for (int i = 0; i < THREAD_COUNT; i++) {
+            List<Future<Boolean>> futures =
+                    new ArrayList<>();
 
-            String userId = "optimistic-user-" + i;
+            for (int i = 0; i < THREAD_COUNT; i++) {
 
-            futures.add(
-                    executor.submit(() -> {
+                String userId =
+                        "optimistic-user-" + i;
 
-                        readyLatch.countDown();
+                futures.add(
+                        executor.submit(() -> {
 
-                        startLatch.await();
+                            readyLatch.countDown();
 
-                        try {
+                            startLatch.await();
 
-                            bookingService.createBookingOptimistic(
-                                    new CreateBookingRequest(
-                                            seatId,
-                                            userId
-                                    )
-                            );
+                            try {
 
-                            return true;
+                                bookingService
+                                        .createBookingOptimistic(
+                                                new CreateBookingRequest(
+                                                        seatId,
+                                                        userId
+                                                )
+                                        );
 
-                        } catch (SeatNotAvailableException |
-                                 ObjectOptimisticLockingFailureException exception) {
+                                return true;
 
-                            return false;
-                        }
-                    })
-            );
-        }
+                            } catch (
+                                    SeatNotAvailableException |
+                                    ObjectOptimisticLockingFailureException exception
+                            ) {
 
-        readyLatch.await();
-
-        startLatch.countDown();
-
-        int successCount = 0;
-        int failureCount = 0;
-
-        for (Future<Boolean> future : futures) {
-
-            try {
-
-                boolean successful = future.get();
-
-                if (successful) {
-                    successCount++;
-                } else {
-                    failureCount++;
-                }
-
-            } catch (ExecutionException exception) {
-
-                fail(
-                        "Unexpected exception: "
-                                + exception.getCause()
+                                return false;
+                            }
+                        })
                 );
             }
+
+            readyLatch.await();
+            startLatch.countDown();
+
+            int successCount = 0;
+            int failureCount = 0;
+
+            for (Future<Boolean> future : futures) {
+
+                try {
+
+                    boolean successful =
+                            future.get();
+
+                    if (successful) {
+                        successCount++;
+                    } else {
+                        failureCount++;
+                    }
+
+                } catch (ExecutionException exception) {
+
+                    fail(
+                            "Unexpected exception: "
+                                    + exception.getCause()
+                    );
+                }
+            }
+
+            assertEquals(
+                    1,
+                    successCount,
+                    "Exactly one optimistic booking should succeed"
+            );
+
+            assertEquals(
+                    THREAD_COUNT - 1,
+                    failureCount,
+                    "All other optimistic booking attempts should fail"
+            );
+
+            assertEquals(
+                    1,
+                    bookingRepository.count(),
+                    "Database must contain exactly one booking"
+            );
+
+            Seat seat = seatRepository.findById(seatId)
+                    .orElseThrow();
+
+            assertEquals(
+                    SeatStatus.BOOKED,
+                    seat.getStatus(),
+                    "Seat must be BOOKED"
+            );
+
+        } finally {
+
+            shutdownExecutor(executor);
         }
+    }
+
+    private void shutdownExecutor(
+            ExecutorService executor
+    ) throws InterruptedException {
 
         executor.shutdown();
 
-        assertEquals(
-                1,
-                successCount,
-                "Exactly one optimistic booking should succeed"
-        );
+        if (!executor.awaitTermination(
+                5,
+                TimeUnit.SECONDS
+        )) {
 
-        assertEquals(
-                THREAD_COUNT - 1,
-                failureCount,
-                "All other optimistic booking attempts should fail"
-        );
+            executor.shutdownNow();
 
-        assertEquals(
-                1,
-                bookingRepository.count(),
-                "Database must contain exactly one booking"
-        );
-
-        Seat seat = seatRepository.findById(seatId)
-                .orElseThrow();
-
-        assertEquals(
-                SeatStatus.BOOKED,
-                seat.getStatus(),
-                "Seat must be BOOKED"
-        );
+            if (!executor.awaitTermination(
+                    5,
+                    TimeUnit.SECONDS
+            )) {
+                throw new IllegalStateException(
+                        "Executor did not terminate"
+                );
+            }
+        }
     }
 }

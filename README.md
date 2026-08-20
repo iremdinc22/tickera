@@ -55,6 +55,7 @@ UPDATE BOOKED                  UPDATE BOOKED
    │                              │
    ▼                              ▼
 CREATE BOOKING                 CREATE BOOKING
+
               💥 DOUBLE BOOKING
 ```
 
@@ -174,10 +175,10 @@ UPDATE BOOKED                       │
 CREATE BOOKING                      │
 COMMIT 🔓                            │
                                      ▼
-                                 READ BOOKED
+                                  READ BOOKED
                                      │
                                      ▼
-                                 409 Conflict
+                                  409 Conflict
 ```
 
 After introducing the lock, the same concurrent test produced:
@@ -239,7 +240,7 @@ A `409 Conflict` is an expected business outcome when another request has alread
 50 concurrent requests
         │
         ▼
-     Same Seat
+      Same Seat
         │
    ┌────┴─────┐
    ▼          ▼
@@ -253,7 +254,6 @@ Results:
 booking_created.............: 1
 booking_conflict............: 49
 unexpected_responses........: 0
-
 Average response time.......: 80.36 ms
 p95 response time...........: 91.62 ms
 Throughput..................: ~441 req/s
@@ -280,7 +280,6 @@ All 100 users attempted to book the same seat.
 ```text
 1 booking created
 99 conflicts
-
 Average latency : 377.67 ms
 p95 latency     : 446.16 ms
 Throughput      : ~208 req/s
@@ -293,7 +292,6 @@ Throughput      : ~208 req/s
 ```text
 100 bookings created
 0 unexpected responses
-
 Average latency : 375.30 ms
 p95 latency     : 409.60 ms
 Throughput      : ~231 req/s
@@ -381,16 +379,16 @@ Spring Boot Actuator exposes application metrics through Micrometer, which are s
 Spring Boot
      │
      ▼
-  Actuator
+   Actuator
      │
      ▼
- Micrometer
+  Micrometer
      │
      ▼
- Prometheus
+  Prometheus
      │
      ▼
-  Grafana
+   Grafana
 ```
 
 The Tickera observability dashboard tracks:
@@ -617,7 +615,6 @@ To test whether synchronous WAL commits were a dominant source of latency, the f
 
 ```text
 synchronous_commit
-
 ON → OFF
 ```
 
@@ -852,6 +849,7 @@ High contention
 Pessimistic locking may avoid
 wasted conflicting work
 
+
 Low contention
       │
       ▼
@@ -860,6 +858,139 @@ unnecessary lock coordination
 ```
 
 These measurements are experimental observations from a local environment and should not be interpreted as universal performance characteristics.
+
+---
+
+# Automated Concurrency Integration Testing
+
+The manually verified concurrency invariant is now protected by automated integration tests using JUnit and Testcontainers.
+
+The integration tests run against a real PostgreSQL 17 instance created dynamically by Testcontainers.
+
+The test setup creates a fresh event and seat before executing concurrent booking attempts.
+
+```text
+JUnit
+  │
+  ▼
+Testcontainers
+  │
+  ▼
+PostgreSQL 17
+  │
+  ▼
+Create fresh Event + Seat
+  │
+  ▼
+Launch 20 concurrent booking attempts
+  │
+  ▼
+Verify concurrency invariant
+```
+
+Two booking strategies are currently tested independently:
+
+```text
+                 Same Seat
+                    │
+         ┌──────────┴──────────┐
+         ▼                     ▼
+   Pessimistic             Optimistic
+      Lock                    Lock
+         │                     │
+         └──────────┬──────────┘
+                    ▼
+            20 concurrent users
+                    │
+                    ▼
+              1 successful
+             19 rejected
+                    │
+                    ▼
+           booking count = 1
+                    │
+                    ▼
+            seat = BOOKED
+```
+
+The pessimistic locking test verifies that concurrent transactions waiting on the same database row cannot create duplicate bookings.
+
+The optimistic locking test verifies the same invariant using the `@Version` field on the `Seat` entity.
+
+```java
+@Version
+@Column(nullable = false)
+private Long version;
+```
+
+Under optimistic concurrency, multiple transactions may initially observe the same seat as available.
+
+Only one transaction is allowed to successfully update the current version.
+
+Competing transactions either observe the already-booked seat or fail with an optimistic locking conflict.
+
+The automated tests currently verify:
+
+- Exactly one concurrent booking attempt succeeds
+- All competing booking attempts fail
+- Exactly one booking is persisted
+- The contested seat ends in the `BOOKED` state
+- Pessimistic locking preserves the single-booking invariant
+- Optimistic locking preserves the single-booking invariant
+
+This changes the concurrency verification process from a manual experiment into a repeatable regression test.
+
+Previously:
+
+```text
+Run k6 / curl manually
+        │
+        ▼
+Send concurrent requests
+        │
+        ▼
+Inspect responses
+        │
+        ▼
+Query PostgreSQL manually
+        │
+        ▼
+Verify booking count
+```
+
+Now:
+
+```text
+./mvnw test
+     │
+     ▼
+Start PostgreSQL automatically
+     │
+     ▼
+Run concurrent booking tests
+     │
+     ▼
+Assert database state
+     │
+     ▼
+BUILD SUCCESS / FAILURE
+```
+
+k6 remains responsible for load and performance testing.
+
+JUnit + Testcontainers is responsible for repeatable correctness verification.
+
+```text
+JUnit + Testcontainers
+        │
+        └── Is the system correct under concurrency?
+
+k6
+        │
+        └── How does the system behave under load?
+```
+
+This regression safety net will be especially important as distributed coordination, idempotency, multi-instance deployment, and event-driven processing are introduced later.
 
 ---
 
@@ -913,16 +1044,28 @@ Observability runs alongside the application:
 Spring Boot Actuator
         │
         ▼
-    Micrometer
+     Micrometer
         │
         ▼
-    Prometheus
+     Prometheus
         │
         ▼
-     Grafana
+      Grafana
 ```
 
-The core architecture remains intentionally simple.
+Integration tests use an isolated PostgreSQL environment:
+
+```text
+JUnit
+  │
+  ▼
+Testcontainers
+  │
+  ▼
+PostgreSQL 17
+```
+
+The core runtime architecture remains intentionally simple.
 
 Redis, Kafka, distributed coordination, and other infrastructure will be introduced only when a concrete system problem requires them.
 
@@ -941,6 +1084,11 @@ Redis, Kafka, distributed coordination, and other infrastructure will be introdu
 - Optimistic locking with version-based conflict detection
 - Pessimistic vs optimistic concurrency benchmarking
 - Protection against concurrent double booking
+- JUnit integration testing
+- Testcontainers-based PostgreSQL integration testing
+- Automated pessimistic locking concurrency verification
+- Automated optimistic locking concurrency verification
+- Concurrent single-booking invariant regression testing
 - Swagger / OpenAPI documentation
 - Dockerized PostgreSQL
 - k6 load testing
@@ -992,6 +1140,13 @@ Redis, Kafka, distributed coordination, and other infrastructure will be introdu
 - REST
 - OpenAPI / Swagger
 
+## Testing
+
+- JUnit 5
+- Testcontainers
+- PostgreSQL integration testing
+- k6
+
 ## Performance & Observability
 
 - k6
@@ -1002,7 +1157,6 @@ Redis, Kafka, distributed coordination, and other infrastructure will be introdu
 
 ## Planned
 
-- Testcontainers
 - Redis
 - Kafka
 - GitHub Actions
@@ -1069,10 +1223,10 @@ Optimistic Concurrency
 Compare Concurrency Strategies
           │
           ▼
-Integration & Concurrency Testing       ← NEXT
+Integration & Concurrency Testing       ✓
           │
           ▼
-Idempotency
+Idempotency                             ← NEXT
           │
           ▼
 Redis / Distributed Coordination
@@ -1093,7 +1247,7 @@ Failure Handling & Retry
 Extended Observability
           │
           ▼
-CI/CD & Testcontainers
+CI/CD & GitHub Actions
           │
           ▼
 Final Performance Comparison
@@ -1109,6 +1263,10 @@ The experiments performed so far demonstrate several important properties of the
 - PostgreSQL pessimistic locking prevents the reproduced double-booking race condition.
 - Version-based optimistic locking also preserves the single-booking invariant under concurrent access.
 - Both pessimistic and optimistic strategies prevented double booking in the tested hot-seat workload.
+- The single-booking invariant is now protected by automated integration tests.
+- JUnit and Testcontainers allow concurrency correctness to be verified against a real PostgreSQL instance.
+- Pessimistic locking remains correct under the automated 20-thread same-seat test.
+- Optimistic locking remains correct under the automated 20-thread same-seat test.
 - Expected booking conflicts must be distinguished from actual server failures.
 - Under extreme hot-seat contention, pessimistic locking performed better in the observed local comparison.
 - Under parallel independent-seat workload, optimistic locking showed better p95 latency and throughput in the observed run.
@@ -1129,38 +1287,70 @@ The experiments performed so far demonstrate several important properties of the
 
 ---
 
-# Next Milestone — Automated Concurrency Testing
+# Next Milestone — Idempotency
 
-The next milestone is to convert the manually verified concurrency invariant into repeatable integration tests using JUnit and Testcontainers.
+The next milestone is to introduce idempotency into the booking flow.
 
-The tests will verify that concurrent booking attempts cannot create more than one successful booking for the same seat.
+Concurrency control protects a seat from being claimed successfully by multiple competing transactions.
+
+However, a different problem still exists:
+
+> What happens when the same logical booking request is submitted more than once?
+
+For example, a client may send a booking request successfully but fail to receive the HTTP response because of a temporary network problem.
+
+The client may then retry the same request.
+
+```text
+Client
+  │
+  ├──── POST /bookings ─────► Booking Service
+  │                              │
+  │                              ▼
+  │                         Booking created
+  │                              │
+  │       response lost ✕        │
+  │
+  ├──── retry same request ─────►
+  │
+  ▼
+Could the same logical operation
+be processed twice?
+```
+
+This is different from the original concurrency problem.
+
+Concurrency control asks:
+
+> Can multiple competing transactions claim the same seat?
+
+Idempotency asks:
+
+> Can the same logical request be processed more than once?
+
+The next phase will explore how an idempotency key can identify repeated client requests and ensure that retries do not produce duplicate side effects.
 
 Conceptually:
 
 ```text
-JUnit
-  │
-  ▼
-Start PostgreSQL with Testcontainers
-  │
-  ▼
-Create fresh seat
-  │
-  ▼
-Launch concurrent booking attempts
-  │
-  ▼
-Wait for all requests
-  │
-  ▼
-Verify invariant
-  │
-  ├── Exactly one successful booking
-  │
-  └── No duplicate booking
+POST /bookings
+Idempotency-Key: abc-123
+        │
+        ▼
+Has this request already
+been processed?
+        │
+   ┌────┴────┐
+   │         │
+  YES        NO
+   │         │
+   ▼         ▼
+Return      Execute
+previous    booking
+result      operation
 ```
 
-This will provide a regression safety net before introducing distributed coordination, idempotency, multi-instance deployment, and event-driven processing.
+This becomes especially important before introducing distributed coordination and multi-instance deployment.
 
 ---
 

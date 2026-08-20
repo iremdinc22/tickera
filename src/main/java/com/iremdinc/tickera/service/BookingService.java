@@ -76,13 +76,53 @@ public class BookingService {
                 meterRegistry.timer("booking.flush.duration")
         );
 
+        return toBookingResponse(savedBooking);
+    }
+
+    @Transactional
+    public BookingResponse createBookingOptimistic(
+            CreateBookingRequest request
+    ) {
+
+        Seat seat = seatRepository.findById(request.seatId())
+                .orElseThrow(() -> new RuntimeException("Seat not found"));
+
+        if (seat.getStatus() != SeatStatus.AVAILABLE) {
+            throw new SeatNotAvailableException(
+                    "Seat is not available"
+            );
+        }
+
+        seat.setStatus(SeatStatus.BOOKED);
+
+        Booking booking = Booking.builder()
+                .seat(seat)
+                .userId(request.userId())
+                .build();
+
+        Booking savedBooking = bookingRepository.save(booking);
+
+        /*
+         * Flush'u transaction sonuna bırakmıyoruz.
+         *
+         * Böylece Seat entity'sindeki @Version kontrolü
+         * burada DB'ye gönderilir ve optimistic locking
+         * conflict'i metodun içinde ortaya çıkar.
+         */
+        bookingRepository.flush();
+
+        return toBookingResponse(savedBooking);
+    }
+
+    private BookingResponse toBookingResponse(Booking booking) {
+
         return new BookingResponse(
-                savedBooking.getId(),
-                savedBooking.getSeat().getId(),
-                savedBooking.getSeat().getSeatNumber(),
-                savedBooking.getUserId(),
-                savedBooking.getStatus(),
-                savedBooking.getCreatedAt()
+                booking.getId(),
+                booking.getSeat().getId(),
+                booking.getSeat().getSeatNumber(),
+                booking.getUserId(),
+                booking.getStatus(),
+                booking.getCreatedAt()
         );
     }
 }

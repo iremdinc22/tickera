@@ -7,6 +7,8 @@ import com.iremdinc.tickera.entity.IdempotencyRecord;
 import com.iremdinc.tickera.entity.Seat;
 import com.iremdinc.tickera.enums.IdempotencyStatus;
 import com.iremdinc.tickera.enums.SeatStatus;
+import com.iremdinc.tickera.event.BookingCreatedEvent;
+import com.iremdinc.tickera.event.BookingEventPublisher;
 import com.iremdinc.tickera.exception.IdempotencyConflictException;
 import com.iremdinc.tickera.exception.SeatNotAvailableException;
 import com.iremdinc.tickera.repository.BookingRepository;
@@ -27,7 +29,9 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.LocalDateTime;
 import java.util.HexFormat;
+import java.util.UUID;
 
 @Service
 @RequiredArgsConstructor
@@ -42,6 +46,7 @@ public class BookingService {
     private final MeterRegistry meterRegistry;
     private final PlatformTransactionManager transactionManager;
     private final SeatHoldService seatHoldService;
+    private final BookingEventPublisher bookingEventPublisher;
 
     @Transactional
     public BookingResponse createBooking(
@@ -55,6 +60,7 @@ public class BookingService {
                 new TransactionSynchronization() {
                     @Override
                     public void afterCompletion(int status) {
+
                         transactionSample.stop(
                                 meterRegistry.timer(
                                         "booking.transaction.duration"
@@ -81,24 +87,31 @@ public class BookingService {
                 )
         );
 
-        if (seat.getStatus() != SeatStatus.AVAILABLE) {
+        if (seat.getStatus()
+                != SeatStatus.AVAILABLE) {
+
             throw new SeatNotAvailableException(
                     "Seat is not available"
             );
         }
 
-        seat.setStatus(SeatStatus.BOOKED);
+        seat.setStatus(
+                SeatStatus.BOOKED
+        );
 
-        Booking booking = Booking.builder()
-                .seat(seat)
-                .userId(request.userId())
-                .build();
+        Booking booking =
+                Booking.builder()
+                        .seat(seat)
+                        .userId(request.userId())
+                        .build();
 
         Timer.Sample saveSample =
                 Timer.start(meterRegistry);
 
         Booking savedBooking =
-                bookingRepository.save(booking);
+                bookingRepository.save(
+                        booking
+                );
 
         saveSample.stop(
                 meterRegistry.timer(
@@ -117,7 +130,18 @@ public class BookingService {
                 )
         );
 
-        return toBookingResponse(savedBooking);
+        /*
+         * Event yalnızca PostgreSQL transaction
+         * başarılı şekilde commit edildikten sonra
+         * Kafka'ya gönderilecek.
+         */
+        publishBookingCreatedAfterCommit(
+                savedBooking
+        );
+
+        return toBookingResponse(
+                savedBooking
+        );
     }
 
     @Transactional
@@ -133,33 +157,49 @@ public class BookingService {
                         )
                 );
 
-        if (seat.getStatus() != SeatStatus.AVAILABLE) {
+        if (seat.getStatus()
+                != SeatStatus.AVAILABLE) {
+
             throw new SeatNotAvailableException(
                     "Seat is not available"
             );
         }
 
-        seat.setStatus(SeatStatus.BOOKED);
+        seat.setStatus(
+                SeatStatus.BOOKED
+        );
 
-        Booking booking = Booking.builder()
-                .seat(seat)
-                .userId(request.userId())
-                .build();
+        Booking booking =
+                Booking.builder()
+                        .seat(seat)
+                        .userId(request.userId())
+                        .build();
 
         Booking savedBooking =
-                bookingRepository.save(booking);
+                bookingRepository.save(
+                        booking
+                );
 
+        /*
+         * @Version conflict'inin transaction
+         * bitmeden ortaya çıkmasını sağlıyoruz.
+         */
         bookingRepository.flush();
 
-        return toBookingResponse(savedBooking);
+        publishBookingCreatedAfterCommit(
+                savedBooking
+        );
+
+        return toBookingResponse(
+                savedBooking
+        );
     }
 
     /**
-     * Redis hold mekanizmasını kullanan booking flow.
+     * Redis seat-hold mekanizmasını kullanan booking flow.
      *
-     * Kullanıcı önce seat'i Redis'te hold etmiş olmalı.
-     * Daha sonra gerçek booking PostgreSQL transaction'ı
-     * ve pessimistic lock altında gerçekleştirilir.
+     * Kullanıcının önce Redis'te ilgili seat'in
+     * aktif hold sahibi olması gerekir.
      */
     @Transactional
     public BookingResponse createHeldBooking(
@@ -167,8 +207,8 @@ public class BookingService {
     ) {
 
         /*
-         * Seat bu kullanıcı tarafından hold edilmemişse
-         * booking işlemine izin vermiyoruz.
+         * Redis'teki hold gerçekten bu kullanıcıya
+         * ait mi kontrol ediyoruz.
          */
         if (!seatHoldService.isHeldByUser(
                 request.seatId(),
@@ -181,20 +221,23 @@ public class BookingService {
         }
 
         /*
-         * Redis hold geçici reservation'ı yönetir.
+         * Redis geçici reservation state'ini yönetiyor.
          *
-         * Gerçek database correctness garantisi için
-         * PostgreSQL pessimistic lock kullanmaya devam ediyoruz.
+         * Final booking correctness için PostgreSQL
+         * pessimistic lock kullanmaya devam ediyoruz.
          */
         Seat seat = seatRepository
-                .findByIdForUpdate(request.seatId())
+                .findByIdForUpdate(
+                        request.seatId()
+                )
                 .orElseThrow(() ->
                         new RuntimeException(
                                 "Seat not found"
                         )
                 );
 
-        if (seat.getStatus() != SeatStatus.AVAILABLE) {
+        if (seat.getStatus()
+                != SeatStatus.AVAILABLE) {
 
             throw new SeatNotAvailableException(
                     "Seat is not available"
@@ -213,11 +256,14 @@ public class BookingService {
 
         Booking savedBooking =
                 bookingRepository
-                        .saveAndFlush(booking);
+                        .saveAndFlush(
+                                booking
+                        );
 
         /*
-         * Booking başarıyla oluşturulduktan sonra
-         * geçici Redis hold'una artık ihtiyaç yok.
+         * Booking başarıyla oluşturuldu.
+         *
+         * Redis hold artık gerekli değil.
          *
          * releaseSeat owner-aware ve atomic çalışır.
          */
@@ -226,22 +272,39 @@ public class BookingService {
                 request.userId()
         );
 
+        publishBookingCreatedAfterCommit(
+                savedBooking
+        );
+
         return toBookingResponse(
                 savedBooking
         );
     }
 
+    /**
+     * Idempotent booking flow.
+     *
+     * Aynı Idempotency-Key + aynı request:
+     * mevcut booking sonucunu döndürür.
+     *
+     * Aynı key + farklı request:
+     * conflict üretir.
+     */
     public BookingResponse createBookingIdempotent(
             String idempotencyKey,
             CreateBookingRequest request
     ) {
 
         String requestHash =
-                generateRequestHash(request);
+                generateRequestHash(
+                        request
+                );
 
-        for (int attempt = 0;
-             attempt < IDEMPOTENCY_MAX_ATTEMPTS;
-             attempt++) {
+        for (
+                int attempt = 0;
+                attempt < IDEMPOTENCY_MAX_ATTEMPTS;
+                attempt++
+        ) {
 
             IdempotencySnapshot snapshot =
                     findIdempotencySnapshot(
@@ -249,8 +312,9 @@ public class BookingService {
                     );
 
             /*
-             * Key daha önce kullanılmışsa request hash'i
-             * aynı mı kontrol ediyoruz.
+             * Key zaten varsa incoming request'in
+             * aynı logical operation olup olmadığını
+             * doğruluyoruz.
              */
             if (snapshot != null) {
 
@@ -260,8 +324,11 @@ public class BookingService {
                 );
 
                 /*
-                 * Daha önce tamamlanmışsa aynı booking
-                 * sonucunu retry yapan client'a döndürüyoruz.
+                 * İşlem daha önce tamamlanmışsa
+                 * yeni booking ve yeni Kafka event'i
+                 * üretmiyoruz.
+                 *
+                 * Existing sonucu döndürüyoruz.
                  */
                 if (snapshot.status()
                         == IdempotencyStatus.COMPLETED) {
@@ -272,15 +339,18 @@ public class BookingService {
                 }
 
                 /*
-                 * PROCESSING durumundaysa başka bir request
-                 * bu logical operation'ın owner'ıdır.
+                 * PROCESSING ise başka request
+                 * bu logical operation'ın owner'ı.
                  */
                 waitBeforeRetry();
+
                 continue;
             }
 
             /*
-             * Henüz record yoksa bu request key'in
+             * Henüz record yok.
+             *
+             * Bu request idempotency key'in
              * owner'ı olmaya çalışır.
              */
             boolean claimed =
@@ -303,8 +373,8 @@ public class BookingService {
             } catch (RuntimeException exception) {
 
                 /*
-                 * Owner işlemi başarısız olursa PROCESSING
-                 * kaydını temizliyoruz.
+                 * Booking başarısızsa PROCESSING
+                 * claim sonsuza kadar bırakılmaz.
                  */
                 releaseIdempotencyClaim(
                         idempotencyKey
@@ -319,6 +389,13 @@ public class BookingService {
         );
     }
 
+    /**
+     * Idempotency key ownership claim.
+     *
+     * REQUIRES_NEW kullanıldığı için PROCESSING
+     * record hemen commit edilir ve concurrent
+     * request'ler tarafından görülebilir.
+     */
     private boolean tryClaimIdempotencyKey(
             String idempotencyKey,
             String requestHash
@@ -330,39 +407,56 @@ public class BookingService {
         try {
 
             Boolean claimed =
-                    transactionTemplate.execute(status -> {
+                    transactionTemplate.execute(
+                            status -> {
 
-                        IdempotencyRecord record =
-                                IdempotencyRecord.builder()
-                                        .idempotencyKey(
-                                                idempotencyKey
-                                        )
-                                        .requestHash(
-                                                requestHash
-                                        )
-                                        .status(
-                                                IdempotencyStatus.PROCESSING
-                                        )
-                                        .build();
+                                IdempotencyRecord record =
+                                        IdempotencyRecord.builder()
+                                                .idempotencyKey(
+                                                        idempotencyKey
+                                                )
+                                                .requestHash(
+                                                        requestHash
+                                                )
+                                                .status(
+                                                        IdempotencyStatus.PROCESSING
+                                                )
+                                                .build();
 
-                        idempotencyRecordRepository
-                                .saveAndFlush(record);
+                                idempotencyRecordRepository
+                                        .saveAndFlush(
+                                                record
+                                        );
 
-                        return true;
-                    });
+                                return true;
+                            }
+                    );
 
-            return Boolean.TRUE.equals(claimed);
+            return Boolean.TRUE.equals(
+                    claimed
+            );
 
-        } catch (DataIntegrityViolationException exception) {
+        } catch (
+                DataIntegrityViolationException exception
+        ) {
 
             /*
-             * UNIQUE(idempotency_key) constraint:
-             * başka bir request key'i bizden önce claim etti.
+             * UNIQUE(idempotency_key)
+             *
+             * Başka bir request key'i bizden
+             * önce claim etti.
              */
             return false;
         }
     }
 
+    /**
+     * Idempotency owner request gerçek booking'i
+     * burada gerçekleştirir.
+     *
+     * Booking + COMPLETED state aynı PostgreSQL
+     * transaction içerisinde commit edilir.
+     */
     private BookingResponse processOwnedBooking(
             String idempotencyKey,
             CreateBookingRequest request
@@ -373,89 +467,120 @@ public class BookingService {
                         transactionManager
                 );
 
-        return transactionTemplate.execute(status -> {
+        return transactionTemplate.execute(
+                status -> {
 
-            Seat seat = seatRepository
-                    .findByIdForUpdate(request.seatId())
-                    .orElseThrow(() ->
-                            new RuntimeException(
-                                    "Seat not found"
-                            )
-                    );
-
-            if (seat.getStatus()
-                    != SeatStatus.AVAILABLE) {
-
-                throw new SeatNotAvailableException(
-                        "Seat is not available"
-                );
-            }
-
-            seat.setStatus(
-                    SeatStatus.BOOKED
-            );
-
-            Booking booking =
-                    Booking.builder()
-                            .seat(seat)
-                            .userId(request.userId())
-                            .build();
-
-            Booking savedBooking =
-                    bookingRepository
-                            .saveAndFlush(booking);
-
-            IdempotencyRecord record =
-                    idempotencyRecordRepository
-                            .findByIdempotencyKey(
-                                    idempotencyKey
+                    Seat seat = seatRepository
+                            .findByIdForUpdate(
+                                    request.seatId()
                             )
                             .orElseThrow(() ->
-                                    new IllegalStateException(
-                                            "Idempotency record not found"
+                                    new RuntimeException(
+                                            "Seat not found"
                                     )
                             );
 
-            record.setBookingId(
-                    savedBooking.getId()
-            );
+                    if (seat.getStatus()
+                            != SeatStatus.AVAILABLE) {
 
-            record.setStatus(
-                    IdempotencyStatus.COMPLETED
-            );
+                        throw new SeatNotAvailableException(
+                                "Seat is not available"
+                        );
+                    }
 
-            idempotencyRecordRepository
-                    .saveAndFlush(record);
+                    seat.setStatus(
+                            SeatStatus.BOOKED
+                    );
 
-            return toBookingResponse(
-                    savedBooking
-            );
-        });
+                    Booking booking =
+                            Booking.builder()
+                                    .seat(seat)
+                                    .userId(
+                                            request.userId()
+                                    )
+                                    .build();
+
+                    Booking savedBooking =
+                            bookingRepository
+                                    .saveAndFlush(
+                                            booking
+                                    );
+
+                    IdempotencyRecord record =
+                            idempotencyRecordRepository
+                                    .findByIdempotencyKey(
+                                            idempotencyKey
+                                    )
+                                    .orElseThrow(() ->
+                                            new IllegalStateException(
+                                                    "Idempotency record not found"
+                                            )
+                                    );
+
+                    record.setBookingId(
+                            savedBooking.getId()
+                    );
+
+                    record.setStatus(
+                            IdempotencyStatus.COMPLETED
+                    );
+
+                    idempotencyRecordRepository
+                            .saveAndFlush(
+                                    record
+                            );
+
+                    /*
+                     * Sadece gerçek owner request
+                     * BookingCreatedEvent üretir.
+                     *
+                     * Aynı idempotency key ile gelen
+                     * retry'lar tekrar event üretmez.
+                     */
+                    publishBookingCreatedAfterCommit(
+                            savedBooking
+                    );
+
+                    return toBookingResponse(
+                            savedBooking
+                    );
+                }
+        );
     }
 
-    private IdempotencySnapshot findIdempotencySnapshot(
+    /**
+     * Idempotency record'u kısa ve bağımsız
+     * transaction içerisinde okur.
+     */
+    private IdempotencySnapshot
+    findIdempotencySnapshot(
             String idempotencyKey
     ) {
 
         TransactionTemplate transactionTemplate =
                 requiresNewTransactionTemplate();
 
-        return transactionTemplate.execute(status ->
-                idempotencyRecordRepository
-                        .findByIdempotencyKey(
-                                idempotencyKey
-                        )
-                        .map(record ->
-                                new IdempotencySnapshot(
-                                        record.getRequestHash(),
-                                        record.getStatus(),
-                                        record.getBookingId()
+        return transactionTemplate.execute(
+                status ->
+                        idempotencyRecordRepository
+                                .findByIdempotencyKey(
+                                        idempotencyKey
                                 )
-                        )
-                        .orElse(null)
+                                .map(record ->
+                                        new IdempotencySnapshot(
+                                                record.getRequestHash(),
+                                                record.getStatus(),
+                                                record.getBookingId()
+                                        )
+                                )
+                                .orElse(null)
         );
     }
 
+    /**
+     * Daha önce tamamlanmış idempotent operation'ın
+     * booking sonucunu döndürür.
+     */
     private BookingResponse findExistingBooking(
             Long bookingId
     ) {
@@ -470,23 +595,31 @@ public class BookingService {
         TransactionTemplate transactionTemplate =
                 requiresNewTransactionTemplate();
 
-        return transactionTemplate.execute(status -> {
+        return transactionTemplate.execute(
+                status -> {
 
-            Booking booking =
-                    bookingRepository
-                            .findById(bookingId)
-                            .orElseThrow(() ->
-                                    new IllegalStateException(
-                                            "Booking linked to idempotency record not found"
+                    Booking booking =
+                            bookingRepository
+                                    .findById(
+                                            bookingId
                                     )
-                            );
+                                    .orElseThrow(() ->
+                                            new IllegalStateException(
+                                                    "Booking linked to idempotency record not found"
+                                            )
+                                    );
 
-            return toBookingResponse(
-                    booking
-            );
-        });
+                    return toBookingResponse(
+                            booking
+                    );
+                }
+        );
     }
 
+    /**
+     * Owner operation başarısız olduğunda
+     * PROCESSING claim'i temizler.
+     */
     private void releaseIdempotencyClaim(
             String idempotencyKey
     ) {
@@ -494,20 +627,22 @@ public class BookingService {
         TransactionTemplate transactionTemplate =
                 requiresNewTransactionTemplate();
 
-        transactionTemplate.executeWithoutResult(status -> {
+        transactionTemplate.executeWithoutResult(
+                status -> {
 
-            idempotencyRecordRepository
-                    .findByIdempotencyKey(
-                            idempotencyKey
-                    )
-                    .filter(record ->
-                            record.getStatus()
-                                    == IdempotencyStatus.PROCESSING
-                    )
-                    .ifPresent(
-                            idempotencyRecordRepository::delete
-                    );
-        });
+                    idempotencyRecordRepository
+                            .findByIdempotencyKey(
+                                    idempotencyKey
+                            )
+                            .filter(record ->
+                                    record.getStatus()
+                                            == IdempotencyStatus.PROCESSING
+                            )
+                            .ifPresent(
+                                    idempotencyRecordRepository::delete
+                            );
+                }
+        );
     }
 
     private void validateRequestHash(
@@ -515,7 +650,9 @@ public class BookingService {
             String incomingHash
     ) {
 
-        if (!existingHash.equals(incomingHash)) {
+        if (!existingHash.equals(
+                incomingHash
+        )) {
 
             throw new IdempotencyConflictException(
                     "Idempotency key was already used with a different request"
@@ -531,9 +668,12 @@ public class BookingService {
                     IDEMPOTENCY_RETRY_DELAY_MS
             );
 
-        } catch (InterruptedException exception) {
+        } catch (
+                InterruptedException exception
+        ) {
 
-            Thread.currentThread().interrupt();
+            Thread.currentThread()
+                    .interrupt();
 
             throw new IllegalStateException(
                     "Interrupted while waiting for idempotent request",
@@ -550,12 +690,67 @@ public class BookingService {
                         transactionManager
                 );
 
-        transactionTemplate.setPropagationBehavior(
-                TransactionDefinition
-                        .PROPAGATION_REQUIRES_NEW
-        );
+        transactionTemplate
+                .setPropagationBehavior(
+                        TransactionDefinition
+                                .PROPAGATION_REQUIRES_NEW
+                );
 
         return transactionTemplate;
+    }
+
+    /**
+     * BookingCreatedEvent'i yalnızca PostgreSQL
+     * transaction commit başarılı olduktan sonra
+     * Kafka'ya gönderir.
+     */
+    private void publishBookingCreatedAfterCommit(
+            Booking booking
+    ) {
+
+        BookingCreatedEvent event =
+                new BookingCreatedEvent(
+                        UUID.randomUUID(),
+                        booking.getId(),
+                        booking.getSeat().getId(),
+                        booking.getSeat().getSeatNumber(),
+                        booking.getUserId(),
+                        booking.getStatus().name(),
+                        LocalDateTime.now()
+                );
+
+        /*
+         * Aktif transaction varsa event'i hemen
+         * göndermiyoruz.
+         */
+        if (TransactionSynchronizationManager
+                .isSynchronizationActive()) {
+
+            TransactionSynchronizationManager
+                    .registerSynchronization(
+                            new TransactionSynchronization() {
+
+                                @Override
+                                public void afterCommit() {
+
+                                    bookingEventPublisher
+                                            .publish(
+                                                    event
+                                            );
+                                }
+                            }
+                    );
+
+            return;
+        }
+
+        /*
+         * Transaction dışında çağrılırsa
+         * doğrudan publish edilir.
+         */
+        bookingEventPublisher.publish(
+                event
+        );
     }
 
     private String generateRequestHash(
@@ -583,9 +778,13 @@ public class BookingService {
 
             return HexFormat
                     .of()
-                    .formatHex(hash);
+                    .formatHex(
+                            hash
+                    );
 
-        } catch (NoSuchAlgorithmException exception) {
+        } catch (
+                NoSuchAlgorithmException exception
+        ) {
 
             throw new IllegalStateException(
                     "SHA-256 algorithm is not available",

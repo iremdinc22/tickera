@@ -1,12 +1,12 @@
 # Tickera — High-Concurrency Ticket Booking System
 
-Tickera is a backend engineering project exploring how a ticket booking system can remain correct and observable under concurrent load.
+Tickera is a backend engineering project exploring how a ticket booking system can remain correct, reliable, and observable under concurrent load.
 
 The project started with a simple question:
 
 > What happens when many users try to book the same seat at the same time?
 
-It then evolved into experiments around concurrency control, idempotency, temporary seat reservations, distributed coordination, load testing, database behavior, observability, and system bottlenecks.
+It evolved into experiments around concurrency control, idempotency, temporary seat reservations, distributed coordination, load testing, database behavior, observability, event-driven processing, reliable event publishing, and duplicate event handling.
 
 ---
 
@@ -25,7 +25,7 @@ seat.setStatus(SeatStatus.BOOKED);
 bookingRepository.save(booking);
 ```
 
-Under concurrent requests, however, multiple transactions may observe the same seat as `AVAILABLE` before either commits.
+Under concurrent requests, multiple transactions may observe the same seat as `AVAILABLE` before either commits.
 
 ```text
 User A                     User B
@@ -38,7 +38,6 @@ UPDATE BOOKED             UPDATE BOOKED
    │                          │
    ▼                          ▼
 CREATE BOOKING            CREATE BOOKING
-
           DOUBLE BOOKING
 ```
 
@@ -71,9 +70,7 @@ WHERE id = ?
 FOR UPDATE;
 ```
 
-The first transaction locks the seat row until commit.
-
-Concurrent requests wait and later observe the seat as already booked.
+The first transaction locks the seat row until commit. Concurrent requests wait and later observe the seat as already booked.
 
 ### Optimistic Locking
 
@@ -105,8 +102,7 @@ Observed locally:
 - Pessimistic locking performed better under extreme hot-seat contention.
 - Optimistic locking performed better in throughput and p95 latency when users booked independent seats.
 - Neither strategy should be considered universally superior.
-
-The contention pattern matters.
+- The contention pattern matters.
 
 ---
 
@@ -139,8 +135,6 @@ The tests verify that:
 - Pessimistic locking preserves the invariant.
 - Optimistic locking preserves the invariant.
 
-Concurrency regressions can be detected automatically with:
-
 ```bash
 ./mvnw test
 ```
@@ -149,11 +143,7 @@ Concurrency regressions can be detected automatically with:
 
 ## Idempotent Booking
 
-Concurrency control prevents competing transactions from successfully claiming the same seat.
-
-It does not solve repeated delivery of the same logical request.
-
-For example:
+Concurrency control prevents competing transactions from successfully claiming the same seat. It does not solve repeated delivery of the same logical request.
 
 ```text
 Client
@@ -187,24 +177,17 @@ created_at
 
 A SHA-256 request fingerprint prevents the same key from being reused for a different booking request.
 
-Behavior:
-
 ```text
 same key + same request
         ↓
 return existing booking
-
 
 same key + different request
         ↓
 409 Conflict
 ```
 
----
-
-## Concurrent Idempotency
-
-Sequential idempotency alone is not enough.
+### Concurrent Idempotency
 
 Multiple identical retries can arrive at the same time and initially observe that the idempotency key does not exist.
 
@@ -216,47 +199,6 @@ COMPLETED
 ```
 
 The database-level unique constraint on `idempotency_key` acts as an ownership mechanism.
-
-```text
-Request A                  Request B
-    │                          │
-    ▼                          ▼
-INSERT PROCESSING        INSERT PROCESSING
-    │                          │
-    ✅                         ❌
-    │                    unique conflict
-    ▼                          │
-  OWNER                      RETRY
-    │                          │
-Create booking                │
-    │                          │
-    ▼                          │
-COMPLETED                     │
-bookingId = 42                │
-    │                          │
-    └───────────┬──────────────┘
-                ▼
-           Booking #42
-```
-
-The automated test sends:
-
-```text
-20 concurrent requests
-+
-same Idempotency-Key
-+
-same request
-```
-
-and verifies:
-
-```text
-1 logical operation
-1 booking
-1 idempotency record
-same booking ID returned
-```
 
 > Seat locking protects a resource. Idempotency protects a logical operation.
 
@@ -296,53 +238,173 @@ Seat holds provide:
 - Validation against non-existing and already booked seats
 - Shared coordination across multiple application instances
 
-Redis is used for temporary reservation state.
-
-PostgreSQL remains the source of truth for permanent booking state and final transaction correctness.
+Redis is used for temporary reservation state. PostgreSQL remains the source of truth for permanent booking state and final transaction correctness.
 
 ---
 
 ## Multi-Instance Coordination
 
-Two independent Tickera instances were run against the same Redis and PostgreSQL infrastructure:
+Two independent Tickera instances were run against the same Redis and PostgreSQL infrastructure.
+
+Concurrent hold requests sent through different instances for the same seat produced one winner and one conflict.
+
+This verifies that hold state is shared distributed state rather than instance-local JVM state.
+
+---
+
+# Kafka & Event-Driven Processing
+
+Successful bookings produce a `BookingCreatedEvent` delivered through Kafka.
 
 ```text
-                 Redis
-                :6380
-               /     \
-              /       \
-     Tickera A         Tickera B
-       :8081             :8082
-              \         /
-               \       /
-              PostgreSQL
-                :5436
+Booking
+   │
+   ▼
+BookingCreatedEvent
+   │
+   ▼
+Kafka: booking-created
+   │
+   ▼
+BookingCreatedEventConsumer
 ```
 
-Concurrent hold requests were sent through different instances for the same seat.
-
-Observed behavior:
+The initial implementation exposed an important distributed-systems failure window:
 
 ```text
-Instance A / user A
+PostgreSQL COMMIT ✅
         │
-        ├──── same seat ────┐
-        │                   │
-Instance B / user B         │
-                            ▼
-                           Redis
-                            │
-                            ▼
-                       one winner
+        ▼
+Kafka publish ❌
+        │
+        ▼
+Booking exists, but event can be lost
 ```
 
-One request received `200 OK`.
+A database transaction cannot atomically commit both PostgreSQL state and a normal Kafka publish.
 
-The competing request received `409 Conflict`.
+Tickera therefore uses the **Transactional Outbox Pattern**.
 
-The winning hold was then successfully used to create the booking through the other Spring Boot instance.
+---
 
-This verified that hold state is shared distributed state rather than instance-local JVM state.
+## Transactional Outbox
+
+Booking state and the event that must eventually be published are persisted in the same PostgreSQL transaction.
+
+```text
+Booking request
+      │
+      ▼
+PostgreSQL transaction
+      │
+      ├── Booking / Seat changes
+      │
+      └── INSERT OutboxEvent
+      │
+      ▼
+    COMMIT
+      │
+      ▼
+outbox_events
+   PENDING
+      │
+      ▼
+OutboxPublisher
+      │
+      ▼
+    Kafka
+      │
+      ▼
+outbox_events
+  PUBLISHED
+```
+
+If Kafka is unavailable, the booking transaction can still commit and the outbox event remains durable as `PENDING`.
+
+When Kafka becomes available again, the publisher retries the pending event.
+
+Only a successful Kafka publish transitions the event to `PUBLISHED`.
+
+This removes the original database-to-Kafka event-loss window.
+
+---
+
+## Multi-Instance Outbox Publishing
+
+Outbox publishing was also exercised with multiple Tickera instances sharing PostgreSQL and Kafka.
+
+```text
+              PostgreSQL
+                  │
+            outbox_events
+                  │
+          ┌───────┴───────┐
+          ▼               ▼
+     Tickera A        Tickera B
+          │               │
+          └───────┬───────┘
+                  ▼
+                Kafka
+```
+
+This matters because multiple scheduled publishers must not independently publish the same pending event.
+
+For the tested booking event, Kafka inspection confirmed a single record for the target booking.
+
+---
+
+## Idempotent Kafka Consumer
+
+Reliable publishing does not mean duplicate delivery can never occur.
+
+For example:
+
+```text
+Kafka publish ✅
+      │
+      ▼
+application crash
+      │
+      ▼
+local PUBLISHED state not recorded
+      │
+      ▼
+event may be published again
+```
+
+Tickera therefore tracks consumed event IDs in:
+
+```text
+processed_events
+```
+
+Consumer flow:
+
+```text
+Kafka event
+    │
+    ▼
+Consumer
+    │
+    ▼
+event_id already processed?
+    │
+ ┌──┴───┐
+ │      │
+NO     YES
+ │      │
+ ▼      ▼
+PROCESS IGNORE
+ │
+ ▼
+processed_events
+```
+
+`event_id` is the primary key of `processed_events`, providing a durable duplicate-detection boundary.
+
+An integration test publishes the same `BookingCreatedEvent` twice with the same event ID and verifies that it is logically processed only once.
+
+Kafka integration tests use a real Kafka broker through Testcontainers.
 
 ---
 
@@ -381,8 +443,6 @@ confirming that the single-booking invariant remained valid under load.
 
 The system was gradually tested from low sustained traffic toward local saturation.
 
-Representative behavior:
-
 ```text
 10 req/s       Stable
 50 req/s       Stable
@@ -394,8 +454,6 @@ Representative behavior:
 2000 req/s     Clear saturation signals
 ```
 
-At approximately 2000 requested iterations per second, the system showed increased latency, connection waiting, and dropped iterations.
-
 These are local development-machine measurements and should not be interpreted as production capacity.
 
 ---
@@ -404,61 +462,11 @@ These are local development-machine measurements and should not be interpreted a
 
 Several possible bottlenecks were investigated independently.
 
-### HikariCP
-
-Connection pool:
-
-```text
-10 → 20
-```
-
-Increasing the pool size did not improve throughput and increased latency.
-
-### PostgreSQL
-
-`pg_stat_statements` showed that individual booking queries were very fast.
-
-Representative mean execution times:
-
-```text
-INSERT booking                ~0.082 ms
-UPDATE seat                   ~0.063 ms
-SELECT seat FOR UPDATE        ~0.031 ms
-```
-
-Raw SQL execution time alone therefore did not explain end-to-end latency.
-
-### WAL
-
-PostgreSQL synchronous commits were temporarily disabled:
-
-```text
-synchronous_commit
-
-ON → OFF
-```
-
-This reduced WAL synchronization work but did not materially improve application throughput.
-
-### Tomcat
-
-Worker threads were increased:
-
-```text
-200 → 400
-```
-
-Thread saturation disappeared, but throughput remained almost unchanged.
-
-### k6 Virtual Users
-
-Maximum VUs were increased:
-
-```text
-500 → 1000
-```
-
-Additional concurrency increased latency instead of throughput.
+- Increasing HikariCP from 10 to 20 did not improve throughput.
+- Representative PostgreSQL booking queries were very fast.
+- Temporarily disabling synchronous commits did not materially improve throughput.
+- Increasing Tomcat worker threads from 200 to 400 removed thread saturation but did not materially improve throughput.
+- Increasing k6 concurrency increased latency rather than useful throughput near saturation.
 
 > Near saturation, adding more concurrency can increase waiting without increasing useful throughput.
 
@@ -500,13 +508,7 @@ The dashboard tracks:
 
 ## Test Infrastructure
 
-Integration testing uses real PostgreSQL and Redis containers.
-
-The PostgreSQL integration-test infrastructure is shared through a common base configuration.
-
-Redis-specific tests run against Redis Testcontainers.
-
-Current correctness coverage includes:
+Integration testing uses real infrastructure through Testcontainers where appropriate.
 
 ```text
 PostgreSQL
@@ -520,6 +522,9 @@ Redis
 ├── Invalid seat validation
 ├── Hold ownership
 └── Hold → Booking → Release
+
+Kafka
+└── Duplicate BookingCreatedEvent → process once
 ```
 
 ---
@@ -528,11 +533,12 @@ Redis
 
 Detailed technical notes and experiment results are available in the `docs/` directory:
 
-- [Concurrency Control](docs/concurrency.md) — race conditions, pessimistic vs optimistic locking, and concurrency integration testing
-- [Idempotency](docs/idempotency.md) — idempotency keys, request fingerprinting, concurrent retries, and request ownership
-- [Redis Seat Holds](docs/redis-seat-holds.md) — temporary reservations, TTL, ownership, atomic release, and multi-instance coordination
-- [Performance Testing](docs/performance-testing.md) — k6 workloads, capacity experiments, and bottleneck analysis
-- [Observability](docs/observability.md) — Prometheus, Grafana, HikariCP, Tomcat, JVM, and application-level metrics
+- [Concurrency Control](docs/concurrency.md)
+- [Idempotency](docs/idempotency.md)
+- [Redis Seat Holds](docs/redis-seat-holds.md)
+- [Performance Testing](docs/performance-testing.md)
+- [Observability](docs/observability.md)
+- [Kafka & Reliable Event Processing](docs/kafka-event-processing.md)
 
 ---
 
@@ -542,23 +548,45 @@ Detailed technical notes and experiment results are available in the `docs/` dir
                          Client / k6
                               │
                               ▼
-                       Spring Boot API
+                        Spring Boot API
                               │
-                 ┌────────────┴────────────┐
-                 ▼                         ▼
-        SeatHoldController         BookingController
-                 │                         │
-                 ▼                         ▼
-         SeatHoldService             BookingService
-                 │                         │
-                 ▼                 ┌───────┴────────┐
-               Redis               ▼                ▼
-          SET NX + TTL           Redis          PostgreSQL
-                                  │                 │
-                           Hold ownership          ├── Row locking
-                                                   ├── @Version
-                                                   └── Idempotency
+                  ┌───────────┴────────────┐
+                  ▼                        ▼
+         SeatHoldController        BookingController
+                  │                        │
+                  ▼                        ▼
+          SeatHoldService            BookingService
+                  │                        │
+                  ▼              ┌─────────┴─────────────┐
+                Redis            │ PostgreSQL Transaction │
+           SET NX + TTL          │                       │
+                                 ├── Booking / Seat      │
+                                 ├── Idempotency         │
+                                 └── OutboxEvent         │
+                                          │
+                                          ▼
+                                   outbox_events
+                                      PENDING
+                                          │
+                                          ▼
+                                   OutboxPublisher
+                                          │
+                                          ▼
+                                        Kafka
+                                  booking-created
+                                          │
+                                          ▼
+                             BookingCreatedEventConsumer
+                                          │
+                                          ▼
+                                  processed_events
 ```
+
+PostgreSQL remains the source of truth for permanent booking state.
+
+Redis coordinates temporary seat holds.
+
+Kafka carries asynchronous domain events, while the outbox and processed-event records provide durable reliability boundaries around event delivery.
 
 ---
 
@@ -567,16 +595,18 @@ Detailed technical notes and experiment results are available in the `docs/` dir
 ### Backend
 
 - Java 21
-- Spring Boot
+- Spring Boot 4
 - Spring Data JPA
 - Spring Data Redis
+- Spring Kafka
 - Hibernate
 - Maven
 
-### Data & Coordination
+### Data & Messaging
 
 - PostgreSQL 17
 - Redis 7.4
+- Apache Kafka
 - HikariCP
 - `pg_stat_statements`
 
@@ -586,6 +616,8 @@ Detailed technical notes and experiment results are available in the `docs/` dir
 - Testcontainers
 - PostgreSQL Testcontainers
 - Redis Testcontainers
+- Kafka Testcontainers
+- Spring Kafka Test
 - k6
 
 ### Observability
@@ -624,9 +656,17 @@ Detailed technical notes and experiment results are available in the `docs/` dir
 - Hold ownership enforcement during booking
 - Hold-to-booking lifecycle
 - Multi-instance Redis coordination
-- Redis integration tests with Testcontainers
+- Kafka `BookingCreatedEvent` producer and consumer
+- Transactional Outbox Pattern
+- Durable outbox lifecycle
+- Kafka failure recovery through outbox retry
+- Multi-instance outbox publishing
+- Idempotent Kafka consumer
+- `processed_events` duplicate detection
+- Kafka integration testing with Testcontainers
 - JUnit concurrency integration tests
 - PostgreSQL Testcontainers tests
+- Redis integration tests
 - k6 load and capacity testing
 - Prometheus / Grafana observability
 - HikariCP monitoring
@@ -680,19 +720,25 @@ TTL & Hold Ownership                   ✓
 Multi-Instance Coordination            ✓
         │
         ▼
-Kafka / Event-Driven Processing        ← NEXT
+Kafka / Event-Driven Processing        ✓
         │
         ▼
-Reliable Event Publishing
+Reliable Event Publishing              ✓
         │
         ▼
-Transactional Outbox
+Transactional Outbox                   ✓
         │
         ▼
-Failure Handling & Retry
+Kafka Failure & Recovery               ✓
         │
         ▼
-Idempotent Consumers
+Multi-Instance Outbox Publishing       ✓
+        │
+        ▼
+Idempotent Consumers                   ✓
+        │
+        ▼
+Production Retry / Backoff             ← NEXT
         │
         ▼
 GitHub Actions / CI
@@ -714,44 +760,29 @@ GitHub Actions / CI
 - Database constraints can participate in coordination and ownership mechanisms.
 - Redis is well suited to short-lived reservation state with TTL.
 - Redis seat holds do not replace PostgreSQL transaction correctness.
-- Shared Redis state can coordinate multiple independent application instances.
-- Redis state should be validated against the PostgreSQL source of truth.
+- Shared Redis state can coordinate multiple application instances.
+- A successful database commit does not guarantee a subsequent Kafka publish.
+- Persisting business state and an outbox event in the same transaction closes the database-to-message-broker event-loss window.
+- Reliable event delivery must assume retries and possible duplicate delivery.
+- Consumers should be idempotent when processing events with at-least-once characteristics.
 - Correctness invariants should be protected by repeatable automated tests.
 
 ---
 
-## Next — Kafka & Event-Driven Processing
+## Next — Production-Grade Outbox Retry
 
-The next phase introduces asynchronous event processing after successful bookings.
+The current outbox publisher retries pending events.
 
-```text
-Booking committed
-       │
-       ▼
-BookingCreated
-       │
-       ▼
-     Kafka
-       │
-       ▼
-    Consumer
-```
+The next reliability step is to make retry behavior explicit and operationally safer:
 
-The first implementation will introduce basic producer and consumer behavior.
-
-The following phase will investigate the failure window between PostgreSQL commits and Kafka publishing.
-
-That leads into reliable event delivery patterns such as the Transactional Outbox Pattern.
-
-The goal is to explore:
-
-- Event-driven communication
-- Kafka producers and consumers
-- Delivery guarantees
-- Duplicate event handling
-- Failure and retry behavior
-- Reliable database-to-Kafka event publishing
-- Idempotent event consumption
+- Retry attempt count
+- `FAILED` status
+- Last error information
+- Retry backoff
+- `nextRetryAt`
+- Maximum retry policy
+- Avoiding infinite retries for permanently invalid events
+- Metrics for pending, published, retried, and failed outbox events
 
 ---
 

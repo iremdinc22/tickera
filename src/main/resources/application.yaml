@@ -36,7 +36,7 @@ spring:
       value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
 
       properties:
-        spring.json.trusted.packages: com.iremdinc.tickera
+        spring.json.trusted.packages: com.iremdinc.tickera.event
 
 server:
   tomcat:

@@ -7,8 +7,6 @@ import com.iremdinc.tickera.entity.IdempotencyRecord;
 import com.iremdinc.tickera.entity.Seat;
 import com.iremdinc.tickera.enums.IdempotencyStatus;
 import com.iremdinc.tickera.enums.SeatStatus;
-import com.iremdinc.tickera.event.BookingCreatedEvent;
-import com.iremdinc.tickera.event.BookingEventPublisher;
 import com.iremdinc.tickera.exception.IdempotencyConflictException;
 import com.iremdinc.tickera.exception.SeatNotAvailableException;
 import com.iremdinc.tickera.repository.BookingRepository;
@@ -29,9 +27,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.time.LocalDateTime;
 import java.util.HexFormat;
-import java.util.UUID;
 
 @Service
 @RequiredArgsConstructor
@@ -46,7 +42,7 @@ public class BookingService {
     private final MeterRegistry meterRegistry;
     private final PlatformTransactionManager transactionManager;
     private final SeatHoldService seatHoldService;
-    private final BookingEventPublisher bookingEventPublisher;
+    private final OutboxService outboxService;
 
     @Transactional
     public BookingResponse createBooking(
@@ -131,11 +127,12 @@ public class BookingService {
         );
 
         /*
-         * Event yalnızca PostgreSQL transaction
-         * başarılı şekilde commit edildikten sonra
-         * Kafka'ya gönderilecek.
+         * Kafka'ya doğrudan publish etmiyoruz.
+         *
+         * Booking ve OutboxEvent aynı PostgreSQL
+         * transaction içerisinde yazılır.
          */
-        publishBookingCreatedAfterCommit(
+        outboxService.saveBookingCreatedEvent(
                 savedBooking
         );
 
@@ -182,11 +179,15 @@ public class BookingService {
 
         /*
          * @Version conflict'inin transaction
-         * bitmeden ortaya çıkmasını sağlıyoruz.
+         * tamamlanmadan ortaya çıkmasını sağlıyoruz.
          */
         bookingRepository.flush();
 
-        publishBookingCreatedAfterCommit(
+        /*
+         * Booking ve event bilgisi aynı
+         * PostgreSQL transaction'ında tutulur.
+         */
+        outboxService.saveBookingCreatedEvent(
                 savedBooking
         );
 
@@ -221,10 +222,10 @@ public class BookingService {
         }
 
         /*
-         * Redis geçici reservation state'ini yönetiyor.
+         * Redis temporary reservation state'ini yönetir.
          *
-         * Final booking correctness için PostgreSQL
-         * pessimistic lock kullanmaya devam ediyoruz.
+         * Final booking correctness PostgreSQL
+         * pessimistic locking ile korunmaya devam eder.
          */
         Seat seat = seatRepository
                 .findByIdForUpdate(
@@ -261,19 +262,20 @@ public class BookingService {
                         );
 
         /*
-         * Booking başarıyla oluşturuldu.
-         *
-         * Redis hold artık gerekli değil.
-         *
-         * releaseSeat owner-aware ve atomic çalışır.
+         * Booking oluşturulduğu için corresponding
+         * integration event'i Outbox'a kaydediyoruz.
+         */
+        outboxService.saveBookingCreatedEvent(
+                savedBooking
+        );
+
+        /*
+         * Booking başarılı olduktan sonra Redis'teki
+         * geçici hold artık gerekli değildir.
          */
         seatHoldService.releaseSeat(
                 request.seatId(),
                 request.userId()
-        );
-
-        publishBookingCreatedAfterCommit(
-                savedBooking
         );
 
         return toBookingResponse(
@@ -312,9 +314,9 @@ public class BookingService {
                     );
 
             /*
-             * Key zaten varsa incoming request'in
+             * Key zaten varsa gelen request'in
              * aynı logical operation olup olmadığını
-             * doğruluyoruz.
+             * kontrol ediyoruz.
              */
             if (snapshot != null) {
 
@@ -325,10 +327,9 @@ public class BookingService {
 
                 /*
                  * İşlem daha önce tamamlanmışsa
-                 * yeni booking ve yeni Kafka event'i
-                 * üretmiyoruz.
+                 * yeni Booking veya OutboxEvent üretmiyoruz.
                  *
-                 * Existing sonucu döndürüyoruz.
+                 * Mevcut sonucu döndürüyoruz.
                  */
                 if (snapshot.status()
                         == IdempotencyStatus.COMPLETED) {
@@ -340,7 +341,7 @@ public class BookingService {
 
                 /*
                  * PROCESSING ise başka request
-                 * bu logical operation'ın owner'ı.
+                 * operation owner'ıdır.
                  */
                 waitBeforeRetry();
 
@@ -348,10 +349,8 @@ public class BookingService {
             }
 
             /*
-             * Henüz record yok.
-             *
-             * Bu request idempotency key'in
-             * owner'ı olmaya çalışır.
+             * Record yoksa bu request idempotency
+             * key'in ownership'ini almaya çalışır.
              */
             boolean claimed =
                     tryClaimIdempotencyKey(
@@ -373,8 +372,8 @@ public class BookingService {
             } catch (RuntimeException exception) {
 
                 /*
-                 * Booking başarısızsa PROCESSING
-                 * claim sonsuza kadar bırakılmaz.
+                 * Booking başarısız olursa PROCESSING
+                 * claim sonsuza kadar tutulmaz.
                  */
                 releaseIdempotencyClaim(
                         idempotencyKey
@@ -392,9 +391,8 @@ public class BookingService {
     /**
      * Idempotency key ownership claim.
      *
-     * REQUIRES_NEW kullanıldığı için PROCESSING
-     * record hemen commit edilir ve concurrent
-     * request'ler tarafından görülebilir.
+     * REQUIRES_NEW sayesinde PROCESSING kaydı
+     * bağımsız olarak commit edilir.
      */
     private boolean tryClaimIdempotencyKey(
             String idempotencyKey,
@@ -443,19 +441,19 @@ public class BookingService {
             /*
              * UNIQUE(idempotency_key)
              *
-             * Başka bir request key'i bizden
-             * önce claim etti.
+             * Başka bir request ownership'i
+             * bizden önce aldı.
              */
             return false;
         }
     }
 
     /**
-     * Idempotency owner request gerçek booking'i
+     * Gerçek idempotency owner booking işlemini
      * burada gerçekleştirir.
      *
-     * Booking + COMPLETED state aynı PostgreSQL
-     * transaction içerisinde commit edilir.
+     * Booking + Idempotency COMPLETED + OutboxEvent
+     * aynı PostgreSQL transaction içerisinde yazılır.
      */
     private BookingResponse processOwnedBooking(
             String idempotencyKey,
@@ -531,13 +529,13 @@ public class BookingService {
                             );
 
                     /*
-                     * Sadece gerçek owner request
-                     * BookingCreatedEvent üretir.
+                     * Kafka publish artık burada
+                     * yapılmıyor.
                      *
-                     * Aynı idempotency key ile gelen
-                     * retry'lar tekrar event üretmez.
+                     * Event aynı DB transaction'ında
+                     * Outbox'a yazılıyor.
                      */
-                    publishBookingCreatedAfterCommit(
+                    outboxService.saveBookingCreatedEvent(
                             savedBooking
                     );
 
@@ -549,7 +547,7 @@ public class BookingService {
     }
 
     /**
-     * Idempotency record'u kısa ve bağımsız
+     * Idempotency record'u kısa ve bağımsız bir
      * transaction içerisinde okur.
      */
     private IdempotencySnapshot
@@ -578,8 +576,8 @@ public class BookingService {
     }
 
     /**
-     * Daha önce tamamlanmış idempotent operation'ın
-     * booking sonucunu döndürür.
+     * Daha önce tamamlanan idempotent operation'ın
+     * mevcut booking sonucunu döndürür.
      */
     private BookingResponse findExistingBooking(
             Long bookingId
@@ -617,7 +615,7 @@ public class BookingService {
     }
 
     /**
-     * Owner operation başarısız olduğunda
+     * Owner operation başarısız olursa
      * PROCESSING claim'i temizler.
      */
     private void releaseIdempotencyClaim(
@@ -697,60 +695,6 @@ public class BookingService {
                 );
 
         return transactionTemplate;
-    }
-
-    /**
-     * BookingCreatedEvent'i yalnızca PostgreSQL
-     * transaction commit başarılı olduktan sonra
-     * Kafka'ya gönderir.
-     */
-    private void publishBookingCreatedAfterCommit(
-            Booking booking
-    ) {
-
-        BookingCreatedEvent event =
-                new BookingCreatedEvent(
-                        UUID.randomUUID(),
-                        booking.getId(),
-                        booking.getSeat().getId(),
-                        booking.getSeat().getSeatNumber(),
-                        booking.getUserId(),
-                        booking.getStatus().name(),
-                        LocalDateTime.now()
-                );
-
-        /*
-         * Aktif transaction varsa event'i hemen
-         * göndermiyoruz.
-         */
-        if (TransactionSynchronizationManager
-                .isSynchronizationActive()) {
-
-            TransactionSynchronizationManager
-                    .registerSynchronization(
-                            new TransactionSynchronization() {
-
-                                @Override
-                                public void afterCommit() {
-
-                                    bookingEventPublisher
-                                            .publish(
-                                                    event
-                                            );
-                                }
-                            }
-                    );
-
-            return;
-        }
-
-        /*
-         * Transaction dışında çağrılırsa
-         * doğrudan publish edilir.
-         */
-        bookingEventPublisher.publish(
-                event
-        );
     }
 
     private String generateRequestHash(

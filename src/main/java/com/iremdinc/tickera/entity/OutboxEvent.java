@@ -14,6 +14,14 @@ import java.util.UUID;
                 @Index(
                         name = "idx_outbox_status_created_at",
                         columnList = "status, created_at"
+                ),
+                @Index(
+                        name = "idx_outbox_status_next_retry_at",
+                        columnList = "status, next_retry_at"
+                ),
+                @Index(
+                        name = "idx_outbox_status_processing_started_at",
+                        columnList = "status, processing_started_at"
                 )
         }
 )
@@ -64,6 +72,29 @@ public class OutboxEvent {
     @Builder.Default
     private OutboxStatus status =
             OutboxStatus.PENDING;
+
+    @Column(
+            name = "retry_count",
+            nullable = false
+    )
+    @Builder.Default
+    private Integer retryCount = 0;
+
+    @Column(
+            name = "next_retry_at"
+    )
+    private LocalDateTime nextRetryAt;
+
+    @Column(
+            name = "processing_started_at"
+    )
+    private LocalDateTime processingStartedAt;
+
+    @Column(
+            name = "last_error",
+            columnDefinition = "TEXT"
+    )
+    private String lastError;
 
     @Column(
             name = "created_at",

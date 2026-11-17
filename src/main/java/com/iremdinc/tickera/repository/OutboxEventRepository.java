@@ -11,6 +11,7 @@ import org.springframework.data.repository.query.Param;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 public interface OutboxEventRepository
@@ -71,5 +72,33 @@ public interface OutboxEventRepository
             @Param("status") OutboxStatus status,
             @Param("cutoff") LocalDateTime cutoff,
             Pageable pageable
+    );
+
+    /**
+     * Bir outbox event'ini publisher state geçişi
+     * sırasında row lock ile okur.
+     *
+     * Eski bir publish denemesinin daha yeni bir
+     * state'in üzerine yazmasını engellemek için
+     * kullanılır.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("""
+            SELECT o
+            FROM OutboxEvent o
+            WHERE o.id = :id
+            """)
+    Optional<OutboxEvent> findByIdForUpdate(
+            @Param("id") UUID id
+    );
+
+    /**
+     * Belirli bir outbox status'ündeki kayıt sayısını döndürür.
+     *
+     * OutboxMetrics tarafından PENDING ve FAILED
+     * event sayılarını Gauge olarak expose etmek için kullanılır.
+     */
+    long countByStatus(
+            OutboxStatus status
     );
 }

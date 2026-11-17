@@ -15,6 +15,11 @@ spring:
       ddl-auto: update
     show-sql: false
 
+  task:
+    scheduling:
+      pool:
+        size: 2
+
   data:
     redis:
       host: localhost
@@ -26,8 +31,22 @@ spring:
     bootstrap-servers: localhost:9092
 
     producer:
+      acks: all
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+
+      properties:
+        enable.idempotence: true
+
+        # send() metadata beklerken en fazla bu kadar bloklar.
+        max.block.ms: 5000
+
+        # Producer tek deneme timeout'u.
+        request.timeout.ms: 5000
+
+        # Producer'ın retry'lar dahil toplam teslim süresi.
+        # Uygulama ACK bekleme süresinden (10s) büyük olmalı.
+        delivery.timeout.ms: 15000
 
     consumer:
       group-id: tickera-booking-consumers
@@ -57,3 +76,15 @@ management:
 tickera:
   seat-hold:
     duration: 2m
+
+  outbox:
+    # Kafka broker acknowledgement bekleme üst sınırı.
+    # Stale PROCESSING eşiği 2 dakikadır; bu değer
+    # onun belirgin şekilde altında tutulmalıdır.
+    publish-ack-timeout: 10s
+
+    publish-interval-ms: 2000
+    publish-initial-delay-ms: 0
+
+    stale-recovery-interval-ms: 30000
+    stale-recovery-initial-delay-ms: 0

@@ -50,6 +50,10 @@ public class OutboxAdminService {
                 null
         );
 
+        event.setProcessingStartedAt(
+                null
+        );
+
         event.setLastError(
                 null
         );

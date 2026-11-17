@@ -52,6 +52,21 @@ class IdempotentConsumerIntegrationTest
                 "spring.kafka.listener.auto-startup",
                 () -> "true"
         );
+
+        /*
+         * Kafka broker'ı ve topic diğer Kafka testleriyle
+         * paylaşıldığı için topic'te önceki testlerden
+         * kalan event'ler bulunabilir. Tüketici grubunun
+         * başlangıç offset'i "latest" yapılarak bu testin
+         * yalnızca kendi yayınladığı event'leri tüketmesi
+         * sağlanır. Consumer grubu @KafkaListener
+         * annotation'ında sabit olduğu için güncel broker
+         * üzerinde offset birikmez.
+         */
+        registry.add(
+                "spring.kafka.consumer.auto-offset-reset",
+                () -> "latest"
+        );
     }
 
     @Autowired

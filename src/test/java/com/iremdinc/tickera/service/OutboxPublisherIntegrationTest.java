@@ -37,15 +37,7 @@ import static org.mockito.Mockito.verify;
  * ertelenir; böylece testler yarış koşullarına bağlı
  * kalmaz.
  */
-@SpringBootTest(
-        properties = {
-                "tickera.outbox.publish-initial-delay-ms=3600000",
-                "tickera.outbox.publish-interval-ms=3600000",
-                "tickera.outbox.stale-recovery-initial-delay-ms=3600000",
-                "tickera.outbox.stale-recovery-interval-ms=3600000",
-                "spring.kafka.listener.auto-startup=false"
-        }
-)
+@SpringBootTest
 class OutboxPublisherIntegrationTest
         extends PostgresIntegrationTest {
 

@@ -7,19 +7,16 @@ import com.iremdinc.tickera.exception.SeatNotAvailableException;
 import com.iremdinc.tickera.repository.BookingRepository;
 import com.iremdinc.tickera.repository.EventRepository;
 import com.iremdinc.tickera.repository.SeatRepository;
-import com.iremdinc.tickera.support.PostgresIntegrationTest;
+import com.iremdinc.tickera.support.RedisIntegrationTest;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.test.context.DynamicPropertyRegistry;
-import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.data.redis.core.StringRedisTemplate;
 
-import org.testcontainers.containers.GenericContainer;
-import org.testcontainers.utility.DockerImageName;
-
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
@@ -37,47 +34,25 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
 @SpringBootTest(
-        properties = "tickera.seat-hold.duration=1s"
+        /*
+         * Concurrency testinde TTL, 20 thread'in tamamı
+         * deneme yapmadan önce dolmamalıdır.
+         */
+        properties = "tickera.seat-hold.duration=30s"
 )
 class SeatHoldIntegrationTest
-        extends PostgresIntegrationTest {
+        extends RedisIntegrationTest {
 
     private static final int THREAD_COUNT = 20;
 
     private static final Long NON_EXISTING_SEAT_ID =
             Long.MAX_VALUE;
 
-    @SuppressWarnings("resource")
-    static final GenericContainer<?> redis =
-            new GenericContainer<>(
-                    DockerImageName.parse(
-                            "redis:7.4-alpine"
-                    )
-            )
-                    .withExposedPorts(6379);
-
-    static {
-        redis.start();
-    }
-
-    @DynamicPropertySource
-    static void configureRedis(
-            DynamicPropertyRegistry registry
-    ) {
-
-        registry.add(
-                "spring.data.redis.host",
-                redis::getHost
-        );
-
-        registry.add(
-                "spring.data.redis.port",
-                () -> redis.getMappedPort(6379)
-        );
-    }
-
     @Autowired
     private SeatHoldService seatHoldService;
+
+    @Autowired
+    private StringRedisTemplate redisTemplate;
 
     @Autowired
     private SeatRepository seatRepository;
@@ -289,10 +264,26 @@ class SeatHoldIntegrationTest
     void shouldReleaseSeatAutomaticallyWhenHoldExpires()
             throws InterruptedException {
 
+        /*
+         * TTL doğrulaması, concurrency testinden ayrı
+         * ve kısa TTL'li bir service instance'ı ile
+         * yapılır. Böylece concurrency testindeki
+         * 30 saniyelik TTL, expiry beklentisini
+         * etkilemez.
+         */
+        SeatHoldService expiringSeatHoldService =
+                new SeatHoldService(
+                        redisTemplate,
+                        seatRepository,
+                        Duration.ofSeconds(
+                                1
+                        )
+                );
+
         String userId = "ttl-user";
 
         boolean acquired =
-                seatHoldService.holdSeat(
+                expiringSeatHoldService.holdSeat(
                         expiringSeatId,
                         userId
                 );
@@ -304,21 +295,19 @@ class SeatHoldIntegrationTest
 
         assertEquals(
                 userId,
-                seatHoldService.getHoldOwner(
+                expiringSeatHoldService.getHoldOwner(
                         expiringSeatId
                 ),
                 "Seat should initially be held by the user"
         );
 
-        /*
-         * Test config:
-         *
-         * tickera.seat-hold.duration = 1s
-         */
-        Thread.sleep(1500);
+        awaitHoldExpiration(
+                expiringSeatHoldService,
+                expiringSeatId
+        );
 
         assertNull(
-                seatHoldService.getHoldOwner(
+                expiringSeatHoldService.getHoldOwner(
                         expiringSeatId
                 ),
                 "Seat hold should disappear after TTL expires"
@@ -329,7 +318,7 @@ class SeatHoldIntegrationTest
          * seat'i tekrar hold edebilmeli.
          */
         boolean acquiredAfterExpiration =
-                seatHoldService.holdSeat(
+                expiringSeatHoldService.holdSeat(
                         expiringSeatId,
                         "next-user"
                 );
@@ -397,6 +386,33 @@ class SeatHoldIntegrationTest
                 SeatStatus.BOOKED,
                 bookedSeat.getStatus(),
                 "Seat should remain BOOKED"
+        );
+    }
+
+    private void awaitHoldExpiration(
+            SeatHoldService service,
+            Long seatId
+    ) throws InterruptedException {
+
+        long deadline =
+                System.nanoTime()
+                        + TimeUnit.SECONDS.toNanos(
+                                10
+                        );
+
+        while (System.nanoTime() < deadline) {
+
+            if (service.getHoldOwner(seatId) == null) {
+                return;
+            }
+
+            TimeUnit.MILLISECONDS.sleep(
+                    100
+            );
+        }
+
+        fail(
+                "Seat hold did not expire within 10 seconds"
         );
     }
 

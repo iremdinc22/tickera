@@ -9,18 +9,13 @@ import com.iremdinc.tickera.exception.SeatNotAvailableException;
 import com.iremdinc.tickera.repository.BookingRepository;
 import com.iremdinc.tickera.repository.EventRepository;
 import com.iremdinc.tickera.repository.SeatRepository;
-import com.iremdinc.tickera.support.PostgresIntegrationTest;
+import com.iremdinc.tickera.support.RedisIntegrationTest;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.test.context.DynamicPropertyRegistry;
-import org.springframework.test.context.DynamicPropertySource;
-
-import org.testcontainers.containers.GenericContainer;
-import org.testcontainers.utility.DockerImageName;
 
 import java.time.LocalDateTime;
 
@@ -34,36 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
         properties = "tickera.seat-hold.duration=30s"
 )
 class HeldBookingIntegrationTest
-        extends PostgresIntegrationTest {
-
-    @SuppressWarnings("resource")
-    static final GenericContainer<?> redis =
-            new GenericContainer<>(
-                    DockerImageName.parse(
-                            "redis:7.4-alpine"
-                    )
-            )
-                    .withExposedPorts(6379);
-
-    static {
-        redis.start();
-    }
-
-    @DynamicPropertySource
-    static void configureRedis(
-            DynamicPropertyRegistry registry
-    ) {
-
-        registry.add(
-                "spring.data.redis.host",
-                redis::getHost
-        );
-
-        registry.add(
-                "spring.data.redis.port",
-                () -> redis.getMappedPort(6379)
-        );
-    }
+        extends RedisIntegrationTest {
 
     @Autowired
     private BookingService bookingService;

@@ -3,17 +3,17 @@ package com.iremdinc.tickera.service;
 import com.iremdinc.tickera.event.BookingCreatedEvent;
 import com.iremdinc.tickera.event.BookingEventPublisher;
 import com.iremdinc.tickera.repository.ProcessedEventRepository;
-import com.iremdinc.tickera.support.PostgresIntegrationTest;
+import com.iremdinc.tickera.support.KafkaIntegrationTest;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
+import org.springframework.kafka.listener.MessageListenerContainer;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
-
-import org.testcontainers.kafka.KafkaContainer;
 
 import java.time.LocalDateTime;
 import java.util.UUID;
@@ -23,29 +23,34 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
+/**
+ * Kafka consumer idempotency davranışını izole bir Kafka
+ * Testcontainer'ı üzerinde doğrular.
+ *
+ * Test, listener'ın partition assignment'ını beklemeden
+ * mesaj göndermez. Duplicate kontrolü sabit bir sleep
+ * yerine, aynı partition'a gönderilen bir sentinel event'in
+ * işlenmesiyle senkronize edilir.
+ */
 @SpringBootTest
 class IdempotentConsumerIntegrationTest
-        extends PostgresIntegrationTest {
+        extends KafkaIntegrationTest {
 
-    private static final long TIMEOUT_SECONDS = 10;
-
-    static final KafkaContainer kafka =
-            new KafkaContainer(
-                    "apache/kafka:4.1.1"
-            );
-
-    static {
-        kafka.start();
-    }
+    private static final long TIMEOUT_SECONDS = 30;
 
     @DynamicPropertySource
-    static void configureKafka(
+    static void enableKafkaListener(
             DynamicPropertyRegistry registry
     ) {
 
+        /*
+         * Destek sınıfı listener'ı varsayılan olarak
+         * kapatır. Bu test gerçek consumer davranışını
+         * doğruladığı için burada açıkça etkinleştirilir.
+         */
         registry.add(
-                "spring.kafka.bootstrap-servers",
-                kafka::getBootstrapServers
+                "spring.kafka.listener.auto-startup",
+                () -> "true"
         );
     }
 
@@ -55,10 +60,15 @@ class IdempotentConsumerIntegrationTest
     @Autowired
     private ProcessedEventRepository processedEventRepository;
 
+    @Autowired
+    private KafkaListenerEndpointRegistry listenerEndpointRegistry;
+
     @BeforeEach
     void setUp() {
 
         processedEventRepository.deleteAll();
+
+        awaitListenerAssignment();
     }
 
     @Test
@@ -103,31 +113,112 @@ class IdempotentConsumerIntegrationTest
         );
 
         /*
-         * Duplicate delivery with exactly
-         * the same eventId.
+         * Duplicate delivery with exactly the same eventId.
          */
         bookingEventPublisher.publish(
                 event
         );
 
-        TimeUnit.MILLISECONDS.sleep(
-                500
+        /*
+         * Duplicate'in işlendiğinden emin olmak için aynı
+         * partition'a bir sentinel event gönderiyoruz.
+         * Sentinel işlendiğinde duplicate de consumer
+         * tarafından görülmüş olur.
+         */
+        UUID sentinelEventId =
+                UUID.randomUUID();
+
+        BookingCreatedEvent sentinelEvent =
+                new BookingCreatedEvent(
+                        sentinelEventId,
+                        999003L,
+                        999004L,
+                        "TEST-A2",
+                        "irem",
+                        "PENDING",
+                        LocalDateTime.now()
+                );
+
+        bookingEventPublisher.publish(
+                sentinelEvent
         );
 
-        /*
-         * Duplicate message must not create
-         * another processed_events record.
-         */
+        waitUntilProcessed(
+                sentinelEventId
+        );
+
         assertEquals(
-                1,
+                2,
                 processedEventRepository.count(),
-                "Duplicate delivery must not be processed twice"
+                "Duplicate delivery must not create an extra processed event"
         );
 
         assertTrue(
                 processedEventRepository
                         .existsById(eventId),
                 "Original processed event record must remain"
+        );
+
+        assertTrue(
+                processedEventRepository
+                        .existsById(sentinelEventId),
+                "Sentinel event must be processed"
+        );
+    }
+
+    private void awaitListenerAssignment() {
+
+        long deadline =
+                System.nanoTime()
+                        + TimeUnit.SECONDS.toNanos(
+                                TIMEOUT_SECONDS
+                        );
+
+        while (System.nanoTime() < deadline) {
+
+            boolean assigned =
+                    listenerEndpointRegistry
+                            .getListenerContainers()
+                            .stream()
+                            .filter(
+                                    MessageListenerContainer::isRunning
+                            )
+                            .map(
+                                    MessageListenerContainer::getAssignedPartitions
+                            )
+                            .anyMatch(
+                                    partitions ->
+                                            partitions != null
+                                                    && !partitions.isEmpty()
+                            );
+
+            if (assigned) {
+                return;
+            }
+
+            try {
+
+                TimeUnit.MILLISECONDS.sleep(
+                        100
+                );
+
+            } catch (InterruptedException exception) {
+
+                Thread.currentThread()
+                        .interrupt();
+
+                fail(
+                        "Interrupted while waiting for Kafka listener assignment"
+                );
+
+                return;
+            }
+        }
+
+        fail(
+                "Kafka listener was not assigned within "
+                        + TIMEOUT_SECONDS
+                        + " seconds"
         );
     }
 

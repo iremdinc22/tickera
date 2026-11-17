@@ -4,7 +4,7 @@ import com.iremdinc.tickera.entity.OutboxEvent;
 import com.iremdinc.tickera.enums.OutboxStatus;
 import com.iremdinc.tickera.event.BookingCreatedEvent;
 import com.iremdinc.tickera.repository.OutboxEventRepository;
-import com.iremdinc.tickera.support.PostgresIntegrationTest;
+import com.iremdinc.tickera.support.KafkaIntegrationTest;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -13,9 +13,6 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.test.context.DynamicPropertyRegistry;
-import org.springframework.test.context.DynamicPropertySource;
-import org.testcontainers.kafka.KafkaContainer;
 import tools.jackson.databind.json.JsonMapper;
 
 import java.time.Duration;
@@ -33,49 +30,13 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * Outbox -> gerçek Kafka broker -> ACK -> PUBLISHED
- * akışını Testcontainers üzerinde doğrular.
+ * akışını izole bir Kafka Testcontainer'ı üzerinde doğrular.
  */
-@SpringBootTest(
-        properties = {
-                "tickera.outbox.publish-initial-delay-ms=3600000",
-                "tickera.outbox.publish-interval-ms=3600000",
-                "tickera.outbox.stale-recovery-initial-delay-ms=3600000",
-                "tickera.outbox.stale-recovery-interval-ms=3600000",
-                "spring.kafka.listener.auto-startup=false"
-        }
-)
+@SpringBootTest
 class OutboxKafkaPublishIntegrationTest
-        extends PostgresIntegrationTest {
-
-    private static final String TOPIC =
-            "booking-created";
+        extends KafkaIntegrationTest {
 
     private static final long WAIT_SECONDS = 30;
-
-    static final KafkaContainer kafka =
-            new KafkaContainer(
-                    "apache/kafka:4.1.1"
-            )
-                    .withStartupTimeout(
-                            Duration.ofMinutes(
-                                    3
-                            )
-                    );
-
-    static {
-        kafka.start();
-    }
-
-    @DynamicPropertySource
-    static void configureKafka(
-            DynamicPropertyRegistry registry
-    ) {
-
-        registry.add(
-                "spring.kafka.bootstrap-servers",
-                kafka::getBootstrapServers
-        );
-    }
 
     @Autowired
     private OutboxEventRepository outboxEventRepository;
@@ -203,7 +164,7 @@ class OutboxKafkaPublishIntegrationTest
 
         properties.put(
                 "bootstrap.servers",
-                kafka.getBootstrapServers()
+                bootstrapServers()
         );
 
         properties.put(
@@ -242,7 +203,7 @@ class OutboxKafkaPublishIntegrationTest
 
             consumer.subscribe(
                     List.of(
-                            TOPIC
+                            BOOKING_CREATED_TOPIC
                     )
             );
 

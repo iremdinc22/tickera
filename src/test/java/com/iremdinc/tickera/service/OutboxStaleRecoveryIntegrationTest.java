@@ -10,6 +10,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 
 import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -125,9 +126,18 @@ class OutboxStaleRecoveryIntegrationTest
         UUID eventId =
                 UUID.randomUUID();
 
+        /*
+         * PostgreSQL timestamp kolonları mikrosaniye
+         * hassasiyetinde saklanır. Java'nın nanosecond
+         * hassasiyetli değeri doğrudan karşılaştırıldığında
+         * platforma bağlı olarak yuvarlama farkı oluşabilir.
+         */
         LocalDateTime processingStartedAt =
                 LocalDateTime.now()
-                        .minusSeconds(30);
+                        .minusSeconds(30)
+                        .truncatedTo(
+                                ChronoUnit.MICROS
+                        );
 
         OutboxEvent activeEvent =
                 OutboxEvent.builder()

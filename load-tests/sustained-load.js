@@ -1,7 +1,25 @@
 import http from 'k6/http';
-import { check, sleep } from 'k6';
+import { check } from 'k6';
 import { Counter, Rate } from 'k6/metrics';
 import exec from 'k6/execution';
+import {
+  BASE_URL,
+  bookingParams,
+  bookingPayload,
+  duration,
+  positiveInt,
+} from './lib/config.js';
+
+/*
+ * Sustained arrival-rate workload.
+ *
+ * A constant number of booking attempts is started per second.
+ * Each iteration uses the next seat in the configured range.
+ *
+ * Test data: SEAT_COUNT available, consecutive seats starting at
+ * FIRST_SEAT_ID are required. Keep RATE × DURATION within
+ * SEAT_COUNT if all attempts are expected to succeed.
+ */
 
 const bookingCreated = new Counter('booking_created');
 const bookingConflict = new Counter('booking_conflict');
@@ -9,20 +27,22 @@ const unexpectedResponses = new Counter('unexpected_responses');
 
 const validBookingResponse = new Rate('valid_booking_response');
 
+const FIRST_SEAT_ID = positiveInt('FIRST_SEAT_ID');
+const SEAT_COUNT = positiveInt('SEAT_COUNT', 1000);
+const RATE = positiveInt('RATE', 10);
+const DURATION = duration('DURATION', '30s');
+const PRE_ALLOCATED_VUS = positiveInt('PRE_ALLOCATED_VUS', 20);
+const MAX_VUS = positiveInt('MAX_VUS', 100);
+
 export const options = {
   scenarios: {
     sustained_load: {
       executor: 'constant-arrival-rate',
-
-      // Saniyede 10 yeni booking attempt
-      rate: 10,
+      rate: RATE,
       timeUnit: '1s',
-
-      // 30 saniye boyunca devam et
-      duration: '30s',
-
-      preAllocatedVUs: 20,
-      maxVUs: 100,
+      duration: DURATION,
+      preAllocatedVUs: PRE_ALLOCATED_VUS,
+      maxVUs: MAX_VUS,
     },
   },
 
@@ -34,35 +54,27 @@ export const options = {
 };
 
 export default function () {
-  // Sustained Load Event
-  // Seat IDs: 1013 - 2012
-  const firstSeatId = 2013;
-  const totalSeats = 1000;
-  
-  const iteration = exec.scenario.iterationInTest;
+  const iteration =
+    exec.scenario.iterationInTest;
 
-  // 1000 seat içinde sırayla ilerle
-  const seatOffset = iteration % totalSeats;
-  const seatId = firstSeatId + seatOffset;
-
-  const payload = JSON.stringify({
-    seatId,
-    userId: `sustained-user-${iteration}`,
-  });
-
-  const params = {
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    tags: {
-      endpoint: 'sustained-booking',
-    },
-  };
+  /*
+   * Seat aralığı içinde sırayla ilerle.
+   */
+  const seatId =
+    FIRST_SEAT_ID + (iteration % SEAT_COUNT);
 
   const response = http.post(
-    'http://localhost:8080/bookings',
-    payload,
-    params
+    `${BASE_URL}/bookings`,
+    bookingPayload(
+      seatId,
+      `sustained-user-${iteration}`
+    ),
+    bookingParams(
+      'sustained',
+      {
+        endpoint: 'sustained-booking',
+      }
+    )
   );
 
   if (response.status === 201) {
@@ -80,6 +92,4 @@ export default function () {
     'booking response is valid': (r) =>
       r.status === 201 || r.status === 409,
   });
-
-  sleep(0.1);
 }

@@ -214,6 +214,10 @@ aggregate_id
 event_type
 payload
 status
+retry_count
+next_retry_at
+processing_started_at
+last_error
 created_at
 published_at
 ```
@@ -232,6 +236,9 @@ Basic lifecycle:
 
 ```text
 PENDING
+   │
+   ▼
+PROCESSING
    │
    ▼
 publish to Kafka
@@ -277,6 +284,28 @@ The Kafka publisher waits for the send result before the outbox event is conside
 
 Calling an asynchronous `send()` method alone is not proof that Kafka accepted the record.
 
+Before publishing, an event is claimed in a short database transaction:
+
+```text
+PENDING
+   │
+   ▼
+PROCESSING
+   │
+   ▼
+publish outside the database transaction
+```
+
+The row lock is held only while claiming the event. Kafka acknowledgement
+is awaited outside the transaction so that a slow broker does not hold a
+database lock.
+
+If the acknowledgement does not arrive within
+`tickera.outbox.publish-ack-timeout` (default `10s`), the attempt is
+treated as a failure. The producer may still deliver the record in the
+background, which is why retries can produce duplicates. Consumers must
+therefore tolerate at-least-once delivery.
+
 ---
 
 ## 9. Kafka Failure and Recovery
@@ -306,6 +335,9 @@ Observed lifecycle:
 PENDING
    │
    │ Kafka becomes available
+   ▼
+PROCESSING
+   │
    ▼
 publish
    │
@@ -344,9 +376,10 @@ This creates another concurrency problem:
 
 The outbox flow was tested with multiple application instances sharing PostgreSQL and Kafka.
 
-For the tested booking, Kafka inspection showed one record for the target booking.
+For the tested booking, Kafka inspection showed one record for the target
+booking.
 
-Example verification:
+Example inspection command:
 
 ```bash
 docker exec tickera-kafka \
@@ -354,22 +387,29 @@ docker exec tickera-kafka \
   --bootstrap-server localhost:9092 \
   --topic booking-created \
   --from-beginning \
-  --property print.key=true \
-  --timeout-ms 3000 \
-  2>/dev/null | grep -c BOOKING_ID
+  --max-messages 1 \
+  --property print.key=true
 ```
 
-Expected result for the tested event:
-
-```text
-1
-```
+Observing a single record for one booking does not establish
+exactly-once delivery. Retries can still publish duplicates; the
+consumer-side `processed_events` guard is what makes those duplicates
+safe.
 
 Multi-instance execution remains an important constraint for future outbox changes.
 
 ---
 
-## 11. Why Duplicate Delivery Still Matters
+## 11. At-Least-Once Delivery
+
+The outbox provides **at-least-once** delivery, not exactly-once:
+
+- an event is never intentionally dropped after the booking commits
+- an event may be published more than once when an acknowledgement is
+  lost, a timeout occurs or the process crashes after publishing
+
+Exactly-once delivery would require coordination that the system does not
+attempt. Duplicate safety is moved to the consumer.
 
 Preventing two publishers from intentionally claiming the same event does not mean duplicate delivery can never happen.
 
@@ -603,25 +643,86 @@ Instead, it makes them recoverable.
 
 ---
 
-## 17. Current Limitations
+## 17. Retry, Backoff and Stale Recovery
 
-The core reliability model is implemented, but retry behavior is still intentionally simple.
+Retry behavior is implemented in `OutboxPublisher`.
 
-The next production-oriented improvements include:
+### Publish failure
 
-- Retry attempt count
-- Retry backoff
-- `nextRetryAt`
-- `FAILED` status
-- Last error storage
-- Maximum retry policy
-- Handling permanently invalid payloads
-- Outbox backlog metrics
-- Retry metrics
-- Failure metrics
-- Cleanup / retention strategy for published events
+```text
+PROCESSING
+    │
+    ▼
+retryCount + 1
+    │
+    ├── retryCount < 5 ──► PENDING + nextRetryAt
+    │
+    └── retryCount = 5 ──► FAILED
+```
 
-This will prevent permanently broken events from being retried forever every few seconds.
+Each failure stores `lastError` and clears `processingStartedAt` and
+`publishedAt`.
+
+Backoff is explicit:
+
+| Retry attempt | Delay |
+|---:|---:|
+| 1 | 2 s |
+| 2 | 5 s |
+| 3 | 10 s |
+| 4 | 30 s |
+| 5 | FAILED |
+
+`nextRetryAt` prevents a failed event from being retried immediately on
+every scheduled run.
+
+### Stale PROCESSING recovery
+
+A process can crash after claiming an event but before publishing it.
+The event would remain `PROCESSING` forever.
+
+A separate scheduled job recovers events whose
+`processingStartedAt` is older than 2 minutes:
+
+```text
+PROCESSING (stale)
+      │
+      ▼
+retryCount + 1
+      │
+      ├── retryCount < 5 ──► PENDING + backoff
+      │
+      └── retryCount = 5 ──► FAILED
+```
+
+The recovery job runs every 30 seconds. The scheduler pool size is 2 so
+that stale recovery can run while the publisher is waiting for a Kafka
+acknowledgement.
+
+### Metric correctness
+
+Outbox counters reflect committed state transitions:
+
+- `tickera_outbox_published_total`
+- `tickera_outbox_retry_total`
+- `tickera_outbox_stale_recovery_total`
+- `tickera_outbox_pending_events`
+- `tickera_outbox_failed_events`
+
+Stale-recovery counters are incremented only after the recovery
+transaction commits. A rollback leaves the counters unchanged.
+
+### Manual recovery
+
+A `FAILED` event can be requeued explicitly:
+
+```http
+POST /admin/outbox/{eventId}/requeue
+```
+
+The endpoint resets the event to `PENDING`, clears the retry state and
+allows the publisher to try again. It only accepts events in `FAILED`
+state.
 
 ---
 
@@ -689,34 +790,24 @@ The important architectural boundary is:
 
 ---
 
-## 20. Next Step
+## 20. Remaining Work
 
-The next iteration will make outbox retry behavior production-oriented.
+The core reliability model is implemented, but the following operational
+gaps remain:
 
-Target lifecycle:
+- `FAILED` events require manual inspection and requeue; there is no
+  dead-letter topic.
+- Published outbox rows are not cleaned up automatically; no retention
+  policy is implemented.
+- Prometheus alert rules exist, but no Alertmanager notification channel.
+- The consumer group and topic are fixed in configuration rather than
+  managed as deployment resources.
+- Duplicate delivery remains possible by design (at-least-once), so any
+  future consumer side effect must remain idempotent.
+- Outbox metrics are process-local counters/gauges; a restart resets the
+  counters. The gauges recover their value from the database.
 
-```text
-PENDING
-   │
-   ▼
-PROCESSING
-   │
-   ├── success ─────────────► PUBLISHED
-   │
-   └── failure
-          │
-          ▼
-     retryCount + 1
-          │
-          ▼
-      backoff delay
-          │
-     ┌────┴─────┐
-     │          │
- retry again   max retries
-     │          │
-     ▼          ▼
- PENDING      FAILED
-```
+These are documented limitations rather than hidden production
+guarantees.
 
-This will add explicit failure handling instead of allowing problematic events to retry indefinitely.
+---

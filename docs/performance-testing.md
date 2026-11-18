@@ -6,6 +6,14 @@ The objective is not to claim production-scale capacity.
 
 The objective is to understand how the system behaves as concurrency and request rate increase.
 
+> **Historical baseline.** The measurements in this document were collected
+> during the earlier capacity investigation, before the current
+> `Idempotency-Key` requirement and before outbox retry, backoff, stale
+> recovery and metrics were implemented. They document how the bottlenecks
+> were investigated. They are not measurements of the current codebase.
+> Re-run the scripts in [`load-tests/`](../load-tests/README.md) locally to
+> obtain current numbers.
+
 ---
 
 # Testing Tool
@@ -31,6 +39,40 @@ valid_booking_response
 ```
 
 A `409 Conflict` during a contested-seat workload is expected behavior, not a system failure.
+
+---
+
+# Current k6 Scripts
+
+The maintained scripts live in [`load-tests/`](../load-tests/README.md).
+
+```text
+hot-seat.js             same seat, one winner
+concurrent-booking.js   fixed number of attempts on one seat
+parallel-booking.js     one seat per virtual user
+sustained-load.js       constant arrival rate across a seat range
+capacity-test.js        fresh seat per iteration
+idempotency-replay.js   create → replay → key-conflict contract
+```
+
+All scripts:
+
+- accept `BASE_URL`
+- send a unique `Idempotency-Key` for each independent attempt
+- use the current request shape: `{"seatId": ..., "userId": ...}`
+- treat `201` and the workload-specific `409` responses as explicit
+  business outcomes
+
+Test data must be prepared before each run:
+
+```bash
+eval "$(./load-tests/prepare-test-data.sh 100)"
+k6 run load-tests/parallel-booking.js
+```
+
+Controlled smoke runs are used to validate the scripts. They are not
+performance benchmarks and their numbers are not recorded as capacity
+results.
 
 ---
 
@@ -398,3 +440,7 @@ Therefore these results are useful for:
 - Learning system behavior
 
 They are not production capacity claims.
+
+They are also historical: the current API requires an
+`Idempotency-Key` and includes outbox retry, backoff and stale
+recovery, so current runs will not reproduce these numbers exactly.

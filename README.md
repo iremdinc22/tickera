@@ -1,5 +1,7 @@
 # Tickera — High-Concurrency Ticket Booking System
 
+[![CI](https://github.com/iremdinc22/tickera/actions/workflows/ci.yml/badge.svg)](https://github.com/iremdinc22/tickera/actions/workflows/ci.yml)
+
 Tickera is a backend engineering project exploring how a ticket booking system can remain correct, reliable, and observable under concurrent load.
 
 The project started with a simple question:
@@ -7,6 +9,55 @@ The project started with a simple question:
 > What happens when many users try to book the same seat at the same time?
 
 It evolved into experiments around concurrency control, idempotency, temporary seat reservations, distributed coordination, load testing, database behavior, observability, event-driven processing, reliable event publishing, and duplicate event handling.
+
+---
+
+## Engineering Objectives
+
+Tickera is built around correctness first:
+
+```text
+A seat must never be booked twice
+A client retry must not create a second booking
+A committed booking must eventually produce an event
+A duplicate event must not create a duplicate side effect
+A slow dependency must not corrupt booking state
+```
+
+The project intentionally implements each mechanism only after reproducing
+the failure it addresses, then measures the trade-off.
+
+---
+
+## Quick Start
+
+Requirements: Java 21, Docker.
+
+```bash
+# 1. Start infrastructure (PostgreSQL, Redis, Kafka, Prometheus, Grafana)
+docker compose up -d
+
+# 2. Run the application
+./mvnw spring-boot:run
+```
+
+The application starts on `http://localhost:8080`.
+
+```text
+Actuator health    http://localhost:8080/actuator/health
+OpenAPI UI         http://localhost:8080/swagger-ui/index.html
+Prometheus         http://localhost:9090
+Grafana            http://localhost:3000
+```
+
+Run the full test suite:
+
+```bash
+./mvnw clean verify
+```
+
+The suite uses Testcontainers and does not require the Compose services to
+be running.
 
 ---
 
@@ -44,6 +95,51 @@ CREATE BOOKING            CREATE BOOKING
 The main invariant of the system is:
 
 > A seat must never be successfully booked more than once.
+
+---
+
+## Booking Lifecycle
+
+```text
+Seat: AVAILABLE
+      │
+      │ optional: POST /seats/{id}/hold
+      ▼
+Redis hold (SET NX + TTL)
+      │
+      │ POST /bookings or POST /bookings/held
+      ▼
+PostgreSQL transaction
+├── Seat → BOOKED
+├── Booking INSERT
+├── Idempotency record → COMPLETED
+└── Outbox event → PENDING
+      │
+      ▼
+COMMIT
+      │
+      ├── Redis hold released
+      │
+      └── Outbox publisher
+              │
+              ▼
+        Kafka booking-created
+              │
+              ▼
+        Idempotent consumer
+              │
+              ▼
+        processed_events
+```
+
+Failure at any step leaves the system in a state that can be retried or
+recovered:
+
+- A booking conflict returns `409` and does not change the seat.
+- A retried request with the same idempotency key returns the existing
+  booking.
+- A Kafka outage leaves the outbox event `PENDING`; the publisher retries.
+- A duplicate Kafka delivery is ignored by the consumer.
 
 ---
 
@@ -103,6 +199,10 @@ Observed locally:
 - Optimistic locking performed better in throughput and p95 latency when users booked independent seats.
 - Neither strategy should be considered universally superior.
 - The contention pattern matters.
+
+These are historical local measurements from the earlier implementation.
+They are not production benchmarks; see
+[Performance Testing](docs/performance-testing.md).
 
 ---
 
@@ -408,6 +508,45 @@ Kafka integration tests use a real Kafka broker through Testcontainers.
 
 ---
 
+## Outbox Retry, Backoff and Stale Recovery
+
+Retry behavior is implemented, not planned.
+
+```text
+PENDING
+   │
+   ▼
+PROCESSING
+   │
+   ├── Kafka ACK ──────────────► PUBLISHED
+   │
+   └── failure
+          │
+          ▼
+     retryCount + 1
+          │
+          ├── < 5 ──► PENDING + nextRetryAt
+          │
+          └── = 5 ──► FAILED + lastError
+```
+
+- Backoff: `2s → 5s → 10s → 30s → FAILED`
+- Maximum 5 attempts
+- `nextRetryAt` prevents immediate retry loops
+- `lastError` stores the most recent failure
+- A stale `PROCESSING` event older than 2 minutes is recovered by a
+  separate scheduled job
+- `FAILED` events can be requeued manually through
+  `POST /admin/outbox/{eventId}/requeue`
+- Prometheus exposes published, retry, stale-recovery, pending and failed
+  outbox metrics
+
+Delivery is **at-least-once**. A publish timeout can produce a duplicate
+record, so the consumer records `event_id` in `processed_events` and
+ignores repeated deliveries.
+
+---
+
 ## Load Testing with k6
 
 k6 is used for performance and load testing.
@@ -420,22 +559,40 @@ k6 answers:
 
 > How does the system behave under load?
 
-Workloads include:
+Maintained scripts:
 
-- Hot-seat contention
-- Parallel-seat booking
-- Sustained load
-- Capacity testing
-- Constant arrival-rate experiments
+| Script | Workload |
+|---|---|
+| `hot-seat.js` | All virtual users book the same seat |
+| `concurrent-booking.js` | Fixed number of attempts on one seat |
+| `parallel-booking.js` | Each virtual user books a different seat |
+| `sustained-load.js` | Constant arrival rate across a seat range |
+| `capacity-test.js` | Fresh seat per iteration, all must succeed |
+| `idempotency-replay.js` | Create → replay → key-conflict contract |
 
-A 100-user hot-seat test produced:
+All scripts use the current API contract, including the required
+`Idempotency-Key` header, and accept `BASE_URL` plus workload parameters
+through environment variables.
+
+Prepare fresh test data, then run:
+
+```bash
+eval "$(./load-tests/prepare-test-data.sh 100)"
+k6 run load-tests/parallel-booking.js
+```
+
+See [`load-tests/README.md`](load-tests/README.md) for data sizing,
+smoke-run commands, configuration and troubleshooting.
+
+A 100-user hot-seat test historically produced:
 
 ```text
 1 booking created
 99 conflicts
 ```
 
-confirming that the single-booking invariant remained valid under load.
+These results are from the earlier implementation. Current runs must be
+measured again; see [Performance Testing](docs/performance-testing.md).
 
 ---
 
@@ -454,7 +611,9 @@ The system was gradually tested from low sustained traffic toward local saturati
 2000 req/s     Clear saturation signals
 ```
 
-These are local development-machine measurements and should not be interpreted as production capacity.
+These are historical local development-machine measurements from the
+earlier implementation. They should not be interpreted as production
+capacity or as current benchmark results.
 
 ---
 
@@ -503,28 +662,69 @@ The provisioned dashboards track:
 - Outbox publish, retry and stale-recovery rates
 - Outbox pending and failed event counts
 
----
-
-## Test Infrastructure
-
-Integration testing uses real infrastructure through Testcontainers where appropriate.
+Two dashboards are provisioned from files:
 
 ```text
-PostgreSQL
-├── Pessimistic concurrency
-├── Optimistic concurrency
-└── Idempotency
-
-Redis
-├── Concurrent seat holds
-├── TTL expiration
-├── Invalid seat validation
-├── Hold ownership
-└── Hold → Booking → Release
-
-Kafka
-└── Duplicate BookingCreatedEvent → process once
+Tickera — Application Overview   uid: tickera-application-overview
+Tickera — Outbox & Kafka         uid: tickera-outbox-kafka
 ```
+
+```text
+Prometheus    http://localhost:9090
+Grafana       http://localhost:3000
+```
+
+Prometheus rules provide development alert examples. They have no
+Alertmanager notification channel.
+
+See [Observability](docs/observability.md) for metric names, dashboard
+details and provisioning files.
+
+---
+
+## Automated Testing and CI
+
+The full suite runs with:
+
+```bash
+./mvnw clean verify
+```
+
+Current status: **35 tests**, all passing on Java 21.
+
+```text
+JUnit 5 + Testcontainers
+│
+├── PostgreSQL
+│   ├── Pessimistic concurrency
+│   ├── Optimistic concurrency
+│   ├── Idempotency
+│   ├── Redis hold → booking lifecycle
+│   ├── Outbox retry and stale recovery
+│   └── Outbox metric commit / rollback semantics
+│
+├── Redis
+│   ├── Concurrent seat holds
+│   ├── TTL expiration
+│   ├── Invalid seat validation
+│   ├── Hold ownership
+│   └── Hold → Booking → Release
+│
+└── Kafka
+    └── Duplicate BookingCreatedEvent → process once
+```
+
+GitHub Actions runs the same Maven verification on every push and pull
+request to `main`:
+
+```text
+.github/workflows/ci.yml
+├── Temurin JDK 21
+├── ./mvnw -B clean verify
+└── Surefire / Failsafe report upload
+```
+
+[![CI](https://github.com/iremdinc22/tickera/actions/workflows/ci.yml/badge.svg)](https://github.com/iremdinc22/tickera/actions/workflows/ci.yml)
 
 ---
 
@@ -535,9 +735,10 @@ Detailed technical notes and experiment results are available in the `docs/` dir
 - [Concurrency Control](docs/concurrency.md)
 - [Idempotency](docs/idempotency.md)
 - [Redis Seat Holds](docs/redis-seat-holds.md)
-- [Performance Testing](docs/performance-testing.md)
-- [Observability](docs/observability.md)
 - [Kafka & Reliable Event Processing](docs/kafka-event-processing.md)
+- [Observability](docs/observability.md)
+- [Performance Testing](docs/performance-testing.md)
+- [k6 Load Test Scripts](load-tests/README.md)
 
 ---
 
@@ -619,19 +820,21 @@ Kafka carries asynchronous domain events, while the outbox and processed-event r
 - Spring Kafka Test
 - k6
 
+### API & Infrastructure
+
+- REST
+- Swagger / OpenAPI (springdoc)
+- Docker
+- Docker Compose
+- GitHub Actions CI
+
 ### Observability
 
 - Spring Boot Actuator
 - Micrometer
 - Prometheus
 - Grafana
-
-### API & Infrastructure
-
-- REST
-- Swagger / OpenAPI
-- Docker
-- Docker Compose
+- Provisioned dashboards and alert rules
 
 ---
 
@@ -659,6 +862,11 @@ Kafka carries asynchronous domain events, while the outbox and processed-event r
 - Transactional Outbox Pattern
 - Durable outbox lifecycle
 - Kafka failure recovery through outbox retry
+- Retry backoff with `nextRetryAt`
+- `FAILED` outbox state with `lastError`
+- Stale `PROCESSING` recovery after 2 minutes
+- Manual outbox requeue endpoint
+- Outbox metrics for published, retry, stale recovery, pending and failed
 - Multi-instance outbox publishing
 - Idempotent Kafka consumer
 - `processed_events` duplicate detection
@@ -666,48 +874,163 @@ Kafka carries asynchronous domain events, while the outbox and processed-event r
 - JUnit concurrency integration tests
 - PostgreSQL Testcontainers tests
 - Redis integration tests
-- k6 load and capacity testing
+- k6 load and capacity scripts with current API contract
 - Prometheus / Grafana observability
+- Provisioned Grafana dashboards and Prometheus alert rules
 - HikariCP monitoring
 - Tomcat thread monitoring
 - PostgreSQL performance investigation
+- GitHub Actions CI on Java 21
 
 ---
 
-## Engineering Roadmap
+## API Usage Examples
+
+Create an event and seats:
+
+```bash
+curl -X POST http://localhost:8080/events \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "Demo Event",
+    "venue": "Local Venue",
+    "eventDate": "2030-01-01T20:00:00",
+    "seatNumbers": ["A1", "A2"]
+  }'
+```
+
+List seats and their IDs:
+
+```bash
+curl http://localhost:8080/events/1/seats
+```
+
+Optional Redis hold:
+
+```bash
+curl -X POST \
+  'http://localhost:8080/seats/100/hold?userId=demo-user'
+```
+
+Create a booking from a held seat:
+
+```bash
+curl -X POST http://localhost:8080/bookings/held \
+  -H 'Content-Type: application/json' \
+  -d '{"seatId": 100, "userId": "demo-user"}'
+```
+
+Create an idempotent booking:
+
+```bash
+curl -X POST http://localhost:8080/bookings \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: demo-key-1' \
+  -d '{"seatId": 101, "userId": "demo-user"}'
+```
+
+Repeating the same request with the same key returns the existing booking.
+Reusing the key with a different seat returns `409 Conflict`.
+
+Requeue a permanently failed outbox event:
+
+```bash
+curl -X POST \
+  http://localhost:8080/admin/outbox/<event-uuid>/requeue
+```
+
+| Response | Meaning |
+|---|---|
+| `201 Created` | Booking created, or idempotent replay returned |
+| `409 Conflict` | Seat unavailable or idempotency-key conflict |
+| `400 Bad Request` | Missing/invalid `Idempotency-Key` or payload |
+| `404 Not Found` | Event or seat does not exist |
+
+---
+
+## Known Limitations and Engineering Trade-offs
+
+**Seat locking**
+
+- Pessimistic locking is simpler under heavy contention but serializes
+  access to the contended row.
+- Optimistic locking scales better for independent rows but returns
+  conflicts under hot-seat load.
+- Tickera keeps both strategies for comparison; the exposed endpoints use
+  the pessimistic flow.
+
+**Redis seat holds**
+
+- Holds are temporary reservation state, not permanent booking state.
+- A Redis outage can prevent new holds; PostgreSQL remains the source of
+  truth for committed bookings.
+- Hold TTL is configuration, not a guarantee that a user will complete a
+  booking.
+
+**Idempotency**
+
+- Idempotency records are stored indefinitely; no retention policy is
+  implemented.
+- The request fingerprint is SHA-256 over the request payload; a changed
+  request with the same key is rejected instead of merged.
+
+**Outbox and Kafka**
+
+- Delivery is at-least-once, not exactly-once.
+- `FAILED` events require manual requeue; there is no dead-letter topic.
+- Published outbox rows are not cleaned up automatically.
+- Outbox counters reset when the application restarts; gauges recover
+  from the database.
+- Consumer side effects must remain idempotent; the current consumer
+  records processed event IDs.
+
+**Operations**
+
+- Prometheus alert rules use development thresholds and have no
+  Alertmanager notification channel.
+- The Compose stack is a local development environment, not a production
+  deployment topology.
+- Performance numbers are local, historical measurements and not
+  production capacity claims.
+
+---
+
+## Project Evolution
+
+All phases below are implemented and covered by the current test suite.
 
 ```text
-Basic Booking Flow
+Basic Booking Flow                     ✓
         │
         ▼
-Reproduce Double Booking
+Reproduce Double Booking               ✓
         │
         ▼
-Pessimistic Locking
+Pessimistic Locking                    ✓
         │
         ▼
-Load Testing
+Load Testing                           ✓
         │
         ▼
-Observability
+Observability                          ✓
         │
         ▼
-Capacity Investigation
+Capacity Investigation                 ✓
         │
         ▼
-Optimistic Locking
+Optimistic Locking                     ✓
         │
         ▼
-Compare Locking Strategies
+Compare Locking Strategies             ✓
         │
         ▼
-Automated Concurrency Tests
+Automated Concurrency Tests            ✓
         │
         ▼
-Idempotency
+Idempotency                            ✓
         │
         ▼
-Concurrent Idempotency
+Concurrent Idempotency                 ✓
         │
         ▼
 Redis Seat Holds                       ✓
@@ -722,9 +1045,6 @@ Multi-Instance Coordination            ✓
 Kafka / Event-Driven Processing        ✓
         │
         ▼
-Reliable Event Publishing              ✓
-        │
-        ▼
 Transactional Outbox                   ✓
         │
         ▼
@@ -737,10 +1057,13 @@ Multi-Instance Outbox Publishing       ✓
 Idempotent Consumers                   ✓
         │
         ▼
-Production Retry / Backoff             ← NEXT
+Outbox Retry / Backoff / Recovery      ✓
         │
         ▼
-GitHub Actions / CI
+Prometheus Alerts & Grafana Dashboards ✓
+        │
+        ▼
+GitHub Actions CI                      ✓
 ```
 
 ---
@@ -765,23 +1088,6 @@ GitHub Actions / CI
 - Reliable event delivery must assume retries and possible duplicate delivery.
 - Consumers should be idempotent when processing events with at-least-once characteristics.
 - Correctness invariants should be protected by repeatable automated tests.
-
----
-
-## Next — Production-Grade Outbox Retry
-
-The current outbox publisher retries pending events.
-
-The next reliability step is to make retry behavior explicit and operationally safer:
-
-- Retry attempt count
-- `FAILED` status
-- Last error information
-- Retry backoff
-- `nextRetryAt`
-- Maximum retry policy
-- Avoiding infinite retries for permanently invalid events
-- Metrics for pending, published, retried, and failed outbox events
 
 ---
 

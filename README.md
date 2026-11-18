@@ -2,6 +2,9 @@
 
 [![CI](https://github.com/iremdinc22/tickera/actions/workflows/ci.yml/badge.svg)](https://github.com/iremdinc22/tickera/actions/workflows/ci.yml)
 
+**Version 1.0.0** — see the [changelog](CHANGELOG.md) and
+[release notes](docs/releases/v1.0.0.md).
+
 Tickera is a backend engineering project exploring how a ticket booking system can remain correct, reliable, and observable under concurrent load.
 
 The project started with a simple question:
@@ -666,7 +669,7 @@ Two dashboards are provisioned from files:
 
 ```text
 Tickera — Application Overview   uid: tickera-application-overview
-Tickera — Outbox & Kafka         uid: tickera-outbox-kafka
+Tickera — Outbox & Kafka Reliability  uid: tickera-outbox-kafka
 ```
 
 ```text
@@ -739,6 +742,8 @@ Detailed technical notes and experiment results are available in the `docs/` dir
 - [Observability](docs/observability.md)
 - [Performance Testing](docs/performance-testing.md)
 - [k6 Load Test Scripts](load-tests/README.md)
+- [Changelog](CHANGELOG.md)
+- [Release Notes v1.0.0](docs/releases/v1.0.0.md)
 
 ---
 

@@ -136,130 +136,155 @@ public class OutboxPublisher {
                         transactionManager
                 );
 
-        transactionTemplate.executeWithoutResult(
-                status -> {
+        RecoveryOutcome outcome =
+                transactionTemplate.execute(
+                        status -> {
 
-                    LocalDateTime now =
-                            LocalDateTime.now();
+                            LocalDateTime now =
+                                    LocalDateTime.now();
 
-                    LocalDateTime cutoff =
-                            now.minusMinutes(
-                                    PROCESSING_TIMEOUT_MINUTES
-                            );
-
-                    List<OutboxEvent> staleEvents =
-                            outboxEventRepository
-                                    .findStaleProcessingEventsForUpdate(
-                                            OutboxStatus.PROCESSING,
-                                            cutoff,
-                                            PageRequest.of(
-                                                    0,
-                                                    BATCH_SIZE
-                                            )
+                            LocalDateTime cutoff =
+                                    now.minusMinutes(
+                                            PROCESSING_TIMEOUT_MINUTES
                                     );
 
-                    if (staleEvents.isEmpty()) {
-                        return;
-                    }
+                            List<OutboxEvent> staleEvents =
+                                    outboxEventRepository
+                                            .findStaleProcessingEventsForUpdate(
+                                                    OutboxStatus.PROCESSING,
+                                                    cutoff,
+                                                    PageRequest.of(
+                                                            0,
+                                                            BATCH_SIZE
+                                                    )
+                                            );
 
-                    for (OutboxEvent event : staleEvents) {
+                            if (staleEvents.isEmpty()) {
+                                return RecoveryOutcome.NONE;
+                            }
 
-                        int currentRetryCount =
-                                event.getRetryCount() == null
-                                        ? 0
-                                        : event.getRetryCount();
+                            int recovered = 0;
+                            int retriesScheduled = 0;
 
-                        int newRetryCount =
-                                currentRetryCount + 1;
+                            for (OutboxEvent event : staleEvents) {
 
-                        event.setRetryCount(
-                                newRetryCount
-                        );
+                                recovered++;
 
-                        event.setProcessingStartedAt(
-                                null
-                        );
+                                int currentRetryCount =
+                                        event.getRetryCount() == null
+                                                ? 0
+                                                : event.getRetryCount();
 
-                        event.setPublishedAt(
-                                null
-                        );
+                                int newRetryCount =
+                                        currentRetryCount + 1;
 
-                        event.setLastError(
-                                "Recovered stale PROCESSING event"
-                        );
-
-                        /*
-                         * Bu event'in stale PROCESSING
-                         * durumundan kurtarıldığını metric'e yaz.
-                         */
-                        outboxMetrics.incrementStaleRecovery();
-
-                        /*
-                         * Çok fazla stale recovery yaşandıysa
-                         * artık otomatik retry yapılmaz.
-                         */
-                        if (newRetryCount
-                                >= MAX_RETRY_ATTEMPTS) {
-
-                            event.setStatus(
-                                    OutboxStatus.FAILED
-                            );
-
-                            event.setNextRetryAt(
-                                    null
-                            );
-
-                            log.error(
-                                    "Stale outbox event moved to FAILED: eventId={}, aggregateId={}, retryCount={}",
-                                    event.getId(),
-                                    event.getAggregateId(),
-                                    newRetryCount
-                            );
-
-                            continue;
-                        }
-
-                        /*
-                         * Event tekrar publish edilebilsin.
-                         */
-                        event.setStatus(
-                                OutboxStatus.PENDING
-                        );
-
-                        long backoffSeconds =
-                                calculateBackoffSeconds(
+                                event.setRetryCount(
                                         newRetryCount
                                 );
 
-                        LocalDateTime nextRetryAt =
-                                now.plusSeconds(
-                                        backoffSeconds
+                                event.setProcessingStartedAt(
+                                        null
                                 );
 
-                        event.setNextRetryAt(
-                                nextRetryAt
-                        );
+                                event.setPublishedAt(
+                                        null
+                                );
 
-                        /*
-                         * Yeni bir retry gerçekten schedule edildi.
-                         */
-                        outboxMetrics.incrementRetry();
+                                event.setLastError(
+                                        "Recovered stale PROCESSING event"
+                                );
 
-                        log.warn(
-                                "Recovered stale PROCESSING outbox event: eventId={}, aggregateId={}, retryCount={}, nextRetryAt={}",
-                                event.getId(),
-                                event.getAggregateId(),
-                                newRetryCount,
-                                nextRetryAt
-                        );
-                    }
+                                /*
+                                 * Çok fazla stale recovery yaşandıysa
+                                 * artık otomatik retry yapılmaz.
+                                 */
+                                if (newRetryCount
+                                        >= MAX_RETRY_ATTEMPTS) {
 
-                    outboxEventRepository
-                            .saveAllAndFlush(
-                                    staleEvents
+                                    event.setStatus(
+                                            OutboxStatus.FAILED
+                                    );
+
+                                    event.setNextRetryAt(
+                                            null
+                                    );
+
+                                    log.error(
+                                            "Stale outbox event moved to FAILED: eventId={}, aggregateId={}, retryCount={}",
+                                            event.getId(),
+                                            event.getAggregateId(),
+                                            newRetryCount
+                                    );
+
+                                    continue;
+                                }
+
+                                /*
+                                 * Event tekrar publish edilebilsin.
+                                 */
+                                event.setStatus(
+                                        OutboxStatus.PENDING
+                                );
+
+                                long backoffSeconds =
+                                        calculateBackoffSeconds(
+                                                newRetryCount
+                                        );
+
+                                LocalDateTime nextRetryAt =
+                                        now.plusSeconds(
+                                                backoffSeconds
+                                        );
+
+                                event.setNextRetryAt(
+                                        nextRetryAt
+                                );
+
+                                retriesScheduled++;
+
+                                log.warn(
+                                        "Recovered stale PROCESSING outbox event: eventId={}, aggregateId={}, retryCount={}, nextRetryAt={}",
+                                        event.getId(),
+                                        event.getAggregateId(),
+                                        newRetryCount,
+                                        nextRetryAt
+                                );
+                            }
+
+                            outboxEventRepository
+                                    .saveAllAndFlush(
+                                            staleEvents
+                                    );
+
+                            return new RecoveryOutcome(
+                                    recovered,
+                                    retriesScheduled
                             );
-                }
+                        }
+                );
+
+        if (outcome == null
+                || outcome.recovered() == 0) {
+
+            return;
+        }
+
+        /*
+         * Sayaçlar yalnızca transaction başarıyla commit
+         * edildikten sonra artırılır. Transaction rollback
+         * olursa metric, gerçekleşmemiş bir state geçişini
+         * yansıtmaz.
+         */
+        outboxMetrics.incrementStaleRecovery(
+                outcome.recovered()
         );
+
+        if (outcome.retriesScheduled() > 0) {
+
+            outboxMetrics.incrementRetry(
+                    outcome.retriesScheduled()
+            );
+        }
     }
 
     /**
@@ -760,5 +785,17 @@ public class OutboxPublisher {
         IGNORED,
         RETRY_SCHEDULED,
         PERMANENTLY_FAILED
+    }
+
+    private record RecoveryOutcome(
+            int recovered,
+            int retriesScheduled
+    ) {
+
+        private static final RecoveryOutcome NONE =
+                new RecoveryOutcome(
+                        0,
+                        0
+                );
     }
 }

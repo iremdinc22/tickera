@@ -492,17 +492,16 @@ Prometheus
 Grafana
 ```
 
-The dashboard tracks:
+The provisioned dashboards track:
 
-- HTTP request rate
-- Booking API p95 latency
+- HTTP request rate, 5xx error rate and p95/p99 latency
+- Booking throughput, conflicts (HTTP 409), success ratio and p95 latency
 - HikariCP active / idle / pending connections
 - Tomcat worker threads
 - JVM heap usage
 - CPU usage
-- Booking transaction duration
-- Seat lock duration
-- Booking persistence duration
+- Outbox publish, retry and stale-recovery rates
+- Outbox pending and failed event counts
 
 ---
 

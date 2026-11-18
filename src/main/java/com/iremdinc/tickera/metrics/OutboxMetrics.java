@@ -75,7 +75,15 @@ public class OutboxMetrics {
         retryCounter.increment();
     }
 
+    public void incrementRetry(int count) {
+        retryCounter.increment(count);
+    }
+
     public void incrementStaleRecovery() {
         staleRecoveryCounter.increment();
+    }
+
+    public void incrementStaleRecovery(int count) {
+        staleRecoveryCounter.increment(count);
     }
 }
